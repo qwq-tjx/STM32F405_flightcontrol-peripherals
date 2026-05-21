@@ -1,0 +1,23 @@
+# Keil 用户配置（含绝对路径，必须忽略）
+*.uvguix.*
+*.uvgui.*
+*.scvd
+*.dbgdt
+
+# 编译输出
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.htm
+*.lnp
+*.map
+*.iex
+*.dep
+*.lst
+Objects/
+Listings/
+DebugConfig/
+RTE/
