@@ -161,12 +161,111 @@ void mavlink_send_scaled_imu(WitImuData_t *imu_data)
     mavlink_send_message(&msg);
 }
 
+// ========== 发送四元数姿态数据 (ATTITUDE_QUATERNION 消息) ==========
+void mavlink_send_imu_quaternion(WitImuData_t *imu_data)
+{
+    mavlink_message_t msg;
+    uint32_t time_ms = delay_ms_count_get();
+
+    // 四元数: quat[0]=w, quat[1]=x, quat[2]=y, quat[3]=z
+    // MAVLink ATTITUDE_QUATERNION: q1=w, q2=x, q3=y, q4=z
+    float qw = imu_data->quat[0];
+    float qx = imu_data->quat[1];
+    float qy = imu_data->quat[2];
+    float qz = imu_data->quat[3];
+
+    // 角速度 (deg/s, 直接使用原始值)
+    float rollspeed = imu_data->gyro[0];
+    float pitchspeed = imu_data->gyro[1];
+    float yawspeed = imu_data->gyro[2];
+
+    mavlink_msg_attitude_quaternion_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_ms,
+        qw, qx, qy, qz,
+        rollspeed, pitchspeed, yawspeed
+    );
+
+    mavlink_send_message(&msg);
+}
+
+// ========== 发送气压数据 (SCALED_PRESSURE 消息) ==========
+void mavlink_send_imu_pressure(WitImuData_t *imu_data)
+{
+    mavlink_message_t msg;
+    uint32_t time_ms = delay_ms_count_get();
+
+    mavlink_msg_scaled_pressure_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_ms,
+        imu_data->pressure,  // 绝对气压 (hPa)
+        0.0f,                // 差压 (无此传感器)
+        0                    // 温度 (0.01°C, 未知)
+    );
+
+    mavlink_send_message(&msg);
+}
+
+// ========== 发送 VFR_HUD (Mission Planner 主屏HUD高度、航向、速度) ==========
+void mavlink_send_vfr_hud(WitImuData_t *imu_data)
+{
+    mavlink_message_t msg;
+    float alt = imu_data->altitude;          // 气压高度 (m)
+    int16_t heading = (int16_t)(imu_data->angle[2]); // 偏航角 (0~360)
+
+    // 包裹航向到 0~360
+    while (heading < 0) heading += 360;
+    heading = heading % 360;
+
+    mavlink_msg_vfr_hud_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        0.0f,           // airspeed (无空速)
+        0.0f,           // groundspeed (无GPS)
+        heading,        // 偏航角
+        0,              // throttle (百分比, 无此数据)
+        alt,            // 高度 (MSL, 米)
+        0.0f            // climb rate (无垂直速度传感器)
+    );
+
+    mavlink_send_message(&msg);
+}
+
+// ========== 发送高度数据 (ALTITUDE 消息) ==========
+void mavlink_send_imu_altitude(WitImuData_t *imu_data)
+{
+    mavlink_message_t msg;
+    uint64_t time_us = delay_ms_count_get() * 1000ULL;
+
+    mavlink_msg_altitude_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_us,
+        imu_data->altitude,  // altitude_monotonic (气压高度)
+        imu_data->altitude,  // altitude_amsl (AMSL海拔)
+        imu_data->altitude,  // altitude_local (本地高度)
+        imu_data->altitude,  // altitude_relative (相对起飞点高度)
+        -1000.0f,            // altitude_terrain (无地形数据)
+        0.0f                 // bottom_clearance (无激光测距)
+    );
+
+    mavlink_send_message(&msg);
+}
+
 // ========== 主动发送 IMU 数据的主函数 (定时器中断中调用) ==========
+// 交错发送: 偶数轮发气压+高度, 奇数轮发ScaledIMU+姿态
+// 每组 ~70B, 115200下 6ms → 100Hz循环有充足余量, 每条消息有效50Hz
 void mavlink_send_imu_periodic(void)
 {
     static uint32_t last_attitude_time = 0;
-    static uint32_t last_hres_time = 0;
     static uint32_t last_heartbeat_time = 0;
+    static uint8_t  msg_phase = 0;
     uint32_t current_time = delay_ms_count_get();
 
     // ========== 心跳包：每秒1次 ==========
@@ -180,21 +279,21 @@ void mavlink_send_imu_periodic(void)
         WitImuData_t imu_data;
         WitImu_GetData(&imu_data);
 
-        // ATTITUDE: 100Hz
         uint32_t attitude_interval_ms = attitude_interval_us / 1000;
         if (current_time - last_attitude_time >= attitude_interval_ms) {
             last_attitude_time = current_time;
-			mavlink_send_scaled_imu(&imu_data);
-            mavlink_send_imu_attitude(&imu_data);
-			
-        }
 
-//        // HIGHRES_IMU: 10Hz (独立控制，降低频率)
-//        uint32_t hres_interval_ms = imu_hres_interval_us / 1000;
-//        if (current_time - last_hres_time >= hres_interval_ms) {
-//            last_hres_time = current_time;
-//            
-//        }
+            if (msg_phase == 0) {
+               // mavlink_send_vfr_hud(&imu_data);        // HUD (航向+高度)
+                mavlink_send_imu_pressure(&imu_data);   // 气压
+                mavlink_send_imu_altitude(&imu_data);   // 高度
+                msg_phase = 1;
+            } else {
+                mavlink_send_scaled_imu(&imu_data);
+                mavlink_send_imu_attitude(&imu_data);
+                msg_phase = 0;
+            }
+        }
     }
 }
 
@@ -343,6 +442,7 @@ static void process_mavlink_message(mavlink_message_t *msg)
                     {
                         uint8_t servo_channel = (uint8_t)cmd.param1;
                         uint16_t servo_value = (uint16_t)cmd.param2;
+                        uint8_t result = MAV_RESULT_ACCEPTED;
                         
                         uint8_t motor_idx = 0xFF;
                         
@@ -375,37 +475,72 @@ static void process_mavlink_message(mavlink_message_t *msg)
                             }
                             Serial_Printf("[RCV] all sync=%d\r\n", servo_value);
                         }
-                        break;
-                    }
-                    
-                    case 512:  // MAV_CMD_REQUEST_MESSAGE
-                    {
-                        uint16_t requested_msg_id = (uint16_t)cmd.param1;
-                        WitImuData_t imu_data;
-                        WitImu_GetData(&imu_data);
-
-                        switch (requested_msg_id) {
-                            case MAVLINK_MSG_ID_ATTITUDE:
-                                mavlink_send_imu_attitude(&imu_data);
-                                break;
-                            case MAVLINK_MSG_ID_HIGHRES_IMU:
-                            case MAVLINK_MSG_ID_SCALED_IMU:
-                                mavlink_send_scaled_imu(&imu_data);
-                                break;
-                            default:
-                                break;
+                        
+                        {
+                            mavlink_message_t ack_msg;
+                            mavlink_msg_command_ack_pack_chan(
+                                mavlink_system.sysid, mavlink_system.compid,
+                                MAVLINK_COMM_0, &ack_msg, cmd.command, result,
+                                0, 0, cmd.target_system, cmd.target_component);
+                            mavlink_send_message(&ack_msg);
                         }
                         break;
                     }
+                    
+//                    case 512:  // MAV_CMD_REQUEST_MESSAGE
+//                    {
+//                        uint16_t requested_msg_id = (uint16_t)cmd.param1;
+//                        WitImuData_t imu_data;
+//                        WitImu_GetData(&imu_data);
+//                        uint8_t result = MAV_RESULT_ACCEPTED;
+
+//                        switch (requested_msg_id) {
+//                            case MAVLINK_MSG_ID_ATTITUDE:
+//                                mavlink_send_imu_attitude(&imu_data);
+//                                break;
+//                            case MAVLINK_MSG_ID_HIGHRES_IMU:
+//                            case MAVLINK_MSG_ID_SCALED_IMU:
+//                                mavlink_send_scaled_imu(&imu_data);
+//                                break;
+//                            case MAVLINK_MSG_ID_ATTITUDE_QUATERNION:
+//                                mavlink_send_imu_quaternion(&imu_data);
+//                                break;
+//                            case MAVLINK_MSG_ID_SCALED_PRESSURE:
+//                                mavlink_send_imu_pressure(&imu_data);
+//                                break;
+//                            case MAVLINK_MSG_ID_ALTITUDE:
+//                                mavlink_send_imu_altitude(&imu_data);
+//                                break;
+//                            case MAVLINK_MSG_ID_VFR_HUD:
+//                                mavlink_send_vfr_hud(&imu_data);
+//                                break;
+//                            default:
+//                                result = MAV_RESULT_UNSUPPORTED;
+//                                break;
+//                        }
+//                        {
+//                            mavlink_message_t ack_msg;
+//                            mavlink_msg_command_ack_pack_chan(
+//                                mavlink_system.sysid, mavlink_system.compid,
+//                                MAVLINK_COMM_0, &ack_msg, cmd.command, result,
+//                                0, 0, cmd.target_system, cmd.target_component);
+//                            mavlink_send_message(&ack_msg);
+//                        }
+//                        break;
+//                    }
                     
                     case 511:  // MAV_CMD_SET_MESSAGE_INTERVAL
                     {
                         uint16_t msg_id = (uint16_t)cmd.param1;
                         int32_t interval_us = (int32_t)cmd.param2;
+                        uint8_t result = MAV_RESULT_ACCEPTED;
                         
                         if (interval_us > 0) {
                             switch (msg_id) {
                                 case MAVLINK_MSG_ID_ATTITUDE:
+                                case MAVLINK_MSG_ID_ALTITUDE:
+                                case MAVLINK_MSG_ID_SCALED_PRESSURE:
+                                case MAVLINK_MSG_ID_VFR_HUD:
                                     attitude_interval_us = (uint32_t)interval_us;
                                     attitude_stream_enabled = 1;
                                     break;
@@ -415,10 +550,21 @@ static void process_mavlink_message(mavlink_message_t *msg)
                                     attitude_stream_enabled = 1;
                                     break;
                                 default:
+                                    result = MAV_RESULT_UNSUPPORTED;
                                     break;
                             }
                         } else if (interval_us == -1) {
                             attitude_stream_enabled = 0;
+                        } else {
+                            result = MAV_RESULT_DENIED;
+                        }
+                        {
+                            mavlink_message_t ack_msg;
+                            mavlink_msg_command_ack_pack_chan(
+                                mavlink_system.sysid, mavlink_system.compid,
+                                MAVLINK_COMM_0, &ack_msg, cmd.command, result,
+                                0, 0, cmd.target_system, cmd.target_component);
+                            mavlink_send_message(&ack_msg);
                         }
                         break;
                     }
@@ -432,6 +578,15 @@ static void process_mavlink_message(mavlink_message_t *msg)
                             0, 0, 0, 0, 0,
                             custom_version, custom_version, custom_version,
                             0, 0, 0, uid2);
+                        {
+                            mavlink_message_t ack_msg;
+                            mavlink_msg_command_ack_pack_chan(
+                                mavlink_system.sysid, mavlink_system.compid,
+                                MAVLINK_COMM_0, &ack_msg, cmd.command,
+                                MAV_RESULT_ACCEPTED,
+                                0, 0, cmd.target_system, cmd.target_component);
+                            mavlink_send_message(&ack_msg);
+                        }
                         break;
                     }
                     

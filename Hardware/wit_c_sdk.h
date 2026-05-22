@@ -138,10 +138,15 @@ typedef struct {
     float gyro[3];     // 角速度 (deg/s)
     float angle[3];    // 角度 (deg): Roll, Pitch, Yaw
     float mag[3];      // 磁力计 (uT/10，即 0.1mT = 100uT)
+    float quat[4];     // 四元数 (w, x, y, z)，归一化值 -1~1
+    float pressure;    // 气压 (hPa)
+    float altitude;    // 高度 (m)
     uint8_t acc_updated:1;
     uint8_t gyro_updated:1;
     uint8_t angle_updated:1;
     uint8_t mag_updated:1;
+    uint8_t quat_updated:1;
+    uint8_t pressure_updated:1;
 } WitImuData_t;
 
 // 回调类型定义

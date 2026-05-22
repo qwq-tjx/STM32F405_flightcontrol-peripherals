@@ -516,10 +516,12 @@ static volatile uint32_t s_uiDataUpdate = 0;
 static volatile char s_cCmd = 0xff;
 static WitImuPrintCb s_pfPrint = NULL;
 
-#define FLAG_ACC    0x01
-#define FLAG_GYRO   0x02
-#define FLAG_ANGLE  0x04
-#define FLAG_MAG    0x08
+#define FLAG_ACC          0x01
+#define FLAG_GYRO         0x02
+#define FLAG_ANGLE        0x04
+#define FLAG_MAG          0x08
+#define FLAG_QUATERNION   0x10
+#define FLAG_PRESS        0x20
 
 static WitImuData_t s_tImuData = {0};
 
@@ -539,6 +541,12 @@ static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum)
     }
     else if(uiReg >= HX && uiReg <= HZ) {
         s_uiDataUpdate |= FLAG_MAG;
+    }
+    else if(uiReg >= q0 && uiReg <= q3) {
+        s_uiDataUpdate |= FLAG_QUATERNION;
+    }
+    else if(uiReg == PressureL) {
+        s_uiDataUpdate |= FLAG_PRESS;
     }
 }
 
@@ -708,9 +716,13 @@ void WitImu_Init(void)
     // 4. 设置输出频率：100Hz（所有数据）
     WitSetOutputRate(RRATE_100HZ);
 
-    // 5. 设置输出内容：加速度 + 角速度 + 角度 + 磁场
+    // 5. 设置输出内容：加速度 + 角速度 + 角度 + 磁场 + 气压
     //    此时 p_WitSerialWriteFunc 已注册，WitSetContent 可以正常工作
-    WitSetContent(RSW_ACC | RSW_GYRO | RSW_ANGLE | RSW_MAG);
+    WitSetContent(RSW_ACC | RSW_GYRO | RSW_ANGLE | RSW_MAG | RSW_PRESS);
+
+    // 6. 保存配置到传感器 Flash（断电不丢失）
+    WitWriteReg(SAVE, SAVE_PARAM);
+    p_WitDelaymsFunc(100);
 
     // 等待 IMU 响应并开始输出数据 (200ms)
     if(p_WitDelaymsFunc) {
@@ -718,7 +730,7 @@ void WitImu_Init(void)
     }
 
     Imu_Printf("\r\n********************** WIT-Motion Normal Example (F405) ************************\r\n");
-    Imu_Printf("Output rate: 100Hz, Content: ACC+GYRO+ANGLE+MAG\r\n");
+    Imu_Printf("Output rate: 100Hz, Content: ACC+GYRO+ANGLE+MAG+PRESS\r\n");
     WitImu_ShowHelp();
 
     WitImu_RegisterPrintCb(WitImu_Print);
@@ -797,6 +809,34 @@ void WitImu_GetData(WitImuData_t *pData)
             s_tImuData.mag_updated = 1;
         }
         
+        // 四元数数据
+        if(uiDataUpdate & FLAG_QUATERNION)
+        {
+            short raw_q0 = sReg[q0];
+            short raw_q1 = sReg[q1];
+            short raw_q2 = sReg[q2];
+            short raw_q3 = sReg[q3];
+            
+            s_tImuData.quat[0] = raw_q0 / 32768.0f;  // w
+            s_tImuData.quat[1] = raw_q1 / 32768.0f;  // x
+            s_tImuData.quat[2] = raw_q2 / 32768.0f;  // y
+            s_tImuData.quat[3] = raw_q3 / 32768.0f;  // z
+            s_tImuData.quat_updated = 1;
+        }
+        
+        // 气压数据 (含高度) — 32-bit 值，高低 16 位分存
+        if(uiDataUpdate & FLAG_PRESS)
+        {
+            // PressureL(0x45)=低16位, PressureH(0x46)=高16位 → 32-bit 气压 (Pa 或 0.01hPa)
+            int32_t rawPressure = ((int32_t)(uint16_t)sReg[PressureH] << 16) | (uint16_t)sReg[PressureL];
+            // HeightL(0x47)=低16位, HeightH(0x48)=高16位 → 32-bit 高度 (cm)
+            int32_t rawAltitude = ((int32_t)(uint16_t)sReg[HeightH]  << 16) | (uint16_t)sReg[HeightL];
+            
+            s_tImuData.pressure = rawPressure / 100.0f;   // → hPa
+            s_tImuData.altitude = rawAltitude / 100.0f;   // → m
+            s_tImuData.pressure_updated = 1;
+        }
+        
         // 清除更新标志
         s_uiDataUpdate = 0;
     }
@@ -808,10 +848,17 @@ void WitImu_GetData(WitImuData_t *pData)
         pData->angle[i] = s_tImuData.angle[i];
         pData->mag[i] = s_tImuData.mag[i];
     }
+    for(i = 0; i < 4; i++) {
+        pData->quat[i] = s_tImuData.quat[i];
+    }
+    pData->pressure = s_tImuData.pressure;
+    pData->altitude = s_tImuData.altitude;
     pData->acc_updated = s_tImuData.acc_updated;
     pData->gyro_updated = s_tImuData.gyro_updated;
     pData->angle_updated = s_tImuData.angle_updated;
     pData->mag_updated = s_tImuData.mag_updated;
+    pData->quat_updated = s_tImuData.quat_updated;
+    pData->pressure_updated = s_tImuData.pressure_updated;
 }
 
 static void WitImu_Print(const char *str)

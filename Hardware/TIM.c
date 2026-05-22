@@ -1,7 +1,8 @@
 #include "stm32f4xx.h"
 #include "adc.h"
 #include "mavlink.h"
-
+#include "Serial.h"
+#include "wit_c_sdk.h"
 // 任务调度定时器初始化
 extern void mavlink_send_imu_periodic(void);
 extern float ADC_GetBatteryVoltage(void);
@@ -246,6 +247,7 @@ void TIM6_DAC_IRQHandler(void)
         // 读取电池电压并发送
         float voltage = ADC_GetBatteryVoltage();
         mavlink_send_battery_voltage(voltage);
+	
     }
 }
 
