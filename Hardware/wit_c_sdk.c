@@ -522,6 +522,7 @@ static WitImuPrintCb s_pfPrint = NULL;
 #define FLAG_MAG          0x08
 #define FLAG_QUATERNION   0x10
 #define FLAG_PRESS        0x20
+#define FLAG_TEMP         0x40
 
 static WitImuData_t s_tImuData = {0};
 
@@ -547,6 +548,9 @@ static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum)
     }
     else if(uiReg == PressureL) {
         s_uiDataUpdate |= FLAG_PRESS;
+    }
+    else if(uiReg == TEMP) {
+        s_uiDataUpdate |= FLAG_TEMP;
     }
 }
 
@@ -716,9 +720,9 @@ void WitImu_Init(void)
     // 4. 设置输出频率：100Hz（所有数据）
     WitSetOutputRate(RRATE_100HZ);
 
-    // 5. 设置输出内容：加速度 + 角速度 + 角度 + 磁场 + 气压
+    // 5. 设置输出内容：加速度 + 角速度 + 角度 + 磁场 + 气压 + 四元数
     //    此时 p_WitSerialWriteFunc 已注册，WitSetContent 可以正常工作
-    WitSetContent(RSW_ACC | RSW_GYRO | RSW_ANGLE | RSW_MAG | RSW_PRESS);
+    WitSetContent(RSW_ACC | RSW_GYRO | RSW_ANGLE | RSW_MAG | RSW_PRESS | RSW_Q);
 
     // 6. 保存配置到传感器 Flash（断电不丢失）
     WitWriteReg(SAVE, SAVE_PARAM);
@@ -837,6 +841,15 @@ void WitImu_GetData(WitImuData_t *pData)
             s_tImuData.pressure_updated = 1;
         }
         
+        // 芯片温度数据 — 随加速度包一起到达 (TEMP 寄存器, 0x40)
+        if(uiDataUpdate & FLAG_TEMP)
+        {
+            // raw 单位为 0.01°C，除以 100 得到 °C
+            short rawTemp = sReg[TEMP];
+            s_tImuData.temperature = rawTemp / 100.0f;
+            s_tImuData.temperature_updated = 1;
+        }
+        
         // 清除更新标志
         s_uiDataUpdate = 0;
     }
@@ -853,12 +866,14 @@ void WitImu_GetData(WitImuData_t *pData)
     }
     pData->pressure = s_tImuData.pressure;
     pData->altitude = s_tImuData.altitude;
+    pData->temperature = s_tImuData.temperature;
     pData->acc_updated = s_tImuData.acc_updated;
     pData->gyro_updated = s_tImuData.gyro_updated;
     pData->angle_updated = s_tImuData.angle_updated;
     pData->mag_updated = s_tImuData.mag_updated;
     pData->quat_updated = s_tImuData.quat_updated;
     pData->pressure_updated = s_tImuData.pressure_updated;
+    pData->temperature_updated = s_tImuData.temperature_updated;
 }
 
 static void WitImu_Print(const char *str)

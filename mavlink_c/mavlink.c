@@ -87,7 +87,7 @@ mavlink_system_t mavlink_system = {
 };
 
 // ========== IMU 数据发送间隔配置 ==========
-static uint32_t attitude_interval_us = 10000;  // ATTITUDE 默认 100Hz
+static uint32_t attitude_interval_us = 100000;  // ATTITUDE 默认 10Hz
 static uint32_t imu_hres_interval_us = 100000; // HIGHRES_IMU 默认 10Hz
 static volatile uint8_t attitude_stream_enabled = 1;
 
@@ -145,6 +145,9 @@ void mavlink_send_scaled_imu(WitImuData_t *imu_data)
     float mag_y = imu_data->mag[1] / 100.0f;
     float mag_z = imu_data->mag[2] / 100.0f;
 
+    // 芯片温度 (°C)
+    float temperature = imu_data->temperature;
+
     // 发送HIGHRES_IMU消息 (ID=105)
     mavlink_msg_highres_imu_pack(
         mavlink_system.sysid,
@@ -154,7 +157,8 @@ void mavlink_send_scaled_imu(WitImuData_t *imu_data)
         acc_x, acc_y, acc_z,
         gyro_x, gyro_y, gyro_z,
         mag_x, mag_y, mag_z,
-        0, 0, 0, 0,
+        0, 0, 0,
+        temperature,
         0x1FFF
     );
 
@@ -287,6 +291,7 @@ void mavlink_send_imu_periodic(void)
                // mavlink_send_vfr_hud(&imu_data);        // HUD (航向+高度)
                 mavlink_send_imu_pressure(&imu_data);   // 气压
                 mavlink_send_imu_altitude(&imu_data);   // 高度
+				mavlink_send_imu_quaternion(&imu_data);
                 msg_phase = 1;
             } else {
                 mavlink_send_scaled_imu(&imu_data);

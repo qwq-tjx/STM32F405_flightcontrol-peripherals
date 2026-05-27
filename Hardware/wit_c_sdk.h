@@ -141,12 +141,14 @@ typedef struct {
     float quat[4];     // 四元数 (w, x, y, z)，归一化值 -1~1
     float pressure;    // 气压 (hPa)
     float altitude;    // 高度 (m)
+    float temperature; // 芯片温度 (°C)
     uint8_t acc_updated:1;
     uint8_t gyro_updated:1;
     uint8_t angle_updated:1;
     uint8_t mag_updated:1;
     uint8_t quat_updated:1;
     uint8_t pressure_updated:1;
+    uint8_t temperature_updated:1;
 } WitImuData_t;
 
 // 回调类型定义

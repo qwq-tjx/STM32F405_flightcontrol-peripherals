@@ -1,0 +1,717 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+using MissionPlanner;
+using MissionPlanner.Plugin;
+
+namespace ImuVisualizationPlugin
+{
+    // ==================================================================
+    //  插件入口
+    // ==================================================================
+    public class ImuVisualizationPlugin : MissionPlanner.Plugin.Plugin
+    {
+        private ImuVisualizationForm _form;
+
+        public override string Name    { get { return "IMU 数据可视化"; } }
+        public override string Version { get { return "1.0"; } }
+        public override string Author  { get { return "Dev"; } }
+
+        public override bool Init() { return true; }
+
+        public override bool Loaded()
+        {
+            _form = new ImuVisualizationForm();
+            _form.Show(Host.MainForm);
+            return true;
+        }
+
+        public override bool Exit()
+        {
+            if (_form != null) { _form.Close(); _form.Dispose(); }
+            return true;
+        }
+
+        public override bool Loop() { return true; }
+    }
+
+    // ==================================================================
+    //  主窗体
+    // ==================================================================
+    public class ImuVisualizationForm : Form
+    {
+        // ---------- IMU 数据缓存 (线程安全) ----------
+        private readonly object _lock = new object();
+        private float _roll, _pitch, _yaw;
+        private float _rollSpeed, _pitchSpeed, _yawSpeed;
+        private float _accX, _accY, _accZ;
+        private float _gyroX, _gyroY, _gyroZ;
+        private float _magX, _magY, _magZ;
+        private float _qw, _qx, _qy, _qz;
+        private float _pressure, _imuTemperature;
+        private float _altMonotonic, _altAmsl, _altLocal, _altRelative;
+        private bool  _hasAttitude, _hasHighresImu, _hasQuaternion, _hasPressure, _hasAltitude;
+
+        // ---------- UI 控件 ----------
+        private ImuValuePanel    _anglePanel;
+        private ImuValuePanel    _gyroPanel;
+        private ImuValuePanel    _accelPanel;
+        private ImuValuePanel    _magPanel;
+        private ImuValuePanel    _quatPanel;
+        private ImuValuePanel    _pressurePanel;
+        private ImuValuePanel    _altitudePanel;
+        private TimeSeriesChart  _attitudeChart;
+        private TimeSeriesChart  _imuChart;
+        private TimeSeriesChart  _altPressureChart;
+        private Label            _statusLabel;
+        private System.Windows.Forms.Timer _refreshTimer;
+        private CheckBox         _chkPause;
+
+        // ---------- 配色 ----------
+        private static readonly Color BgDark  = Color.FromArgb(35, 35, 40);
+        private static readonly Color BgPanel = Color.FromArgb(50, 50, 58);
+        private static readonly Color FgText  = Color.FromArgb(220, 220, 220);
+        private static readonly Color Accent  = Color.FromArgb(0, 140, 220);
+
+        public ImuVisualizationForm()
+        {
+            InitializeForm();
+            SubscribeMavlink();
+            _refreshTimer = new System.Windows.Forms.Timer { Interval = 50 }; // 20 Hz
+            _refreshTimer.Tick += OnRefresh;
+            _refreshTimer.Start();
+        }
+
+        // ===================== 窗体初始化 =====================
+        private void InitializeForm()
+        {
+            this.Text           = "IMU 数据可视化";
+            this.Size           = new Size(1050, 820);
+            this.StartPosition  = FormStartPosition.CenterScreen;
+            this.FormBorderStyle = FormBorderStyle.Sizable;
+            this.BackColor      = BgDark;
+            this.MinimumSize    = new Size(900, 700);
+
+            // --- 状态栏 ---
+            _statusLabel = new Label
+            {
+                Text = "等待 MAVLink 数据...",
+                Dock = DockStyle.Bottom,
+                Height = 26,
+                BackColor = Color.FromArgb(28, 28, 33),
+                ForeColor = Color.FromArgb(180, 180, 180),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(8, 0, 0, 0),
+                Font = new Font("Segoe UI", 8.5f)
+            };
+            this.Controls.Add(_statusLabel);
+
+            // --- 暂停复选框 ---
+            _chkPause = new CheckBox
+            {
+                Text = "暂停刷新",
+                Location = new Point(this.ClientSize.Width - 110, 6),
+                AutoSize = true,
+                ForeColor = FgText,
+                BackColor = BgDark
+            };
+            _chkPause.BringToFront();
+            this.Controls.Add(_chkPause);
+            this.Resize += (s, e) => { if (_chkPause != null) _chkPause.Left = this.ClientSize.Width - 110; };
+
+            // ======== 第一行：欧拉角 | 角速度 | 加速度 ========
+            _anglePanel = new ImuValuePanel("欧拉角 (°)")
+            {
+                Location = new Point(10, 10),
+                Size = new Size(330, 160),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("Roll",  Color.Cyan),
+                    new ImuValueRow("Pitch", Color.Lime),
+                    new ImuValueRow("Yaw",   Color.Orange)
+                }
+            };
+            this.Controls.Add(_anglePanel);
+
+            _gyroPanel = new ImuValuePanel("角速度 (rad/s)")
+            {
+                Location = new Point(350, 10),
+                Size = new Size(330, 160),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("X", Color.Cyan),
+                    new ImuValueRow("Y", Color.Lime),
+                    new ImuValueRow("Z", Color.Orange)
+                }
+            };
+            this.Controls.Add(_gyroPanel);
+
+            _accelPanel = new ImuValuePanel("加速度 (m/s²)")
+            {
+                Location = new Point(690, 10),
+                Size = new Size(330, 160),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("X", Color.Cyan),
+                    new ImuValueRow("Y", Color.Lime),
+                    new ImuValueRow("Z", Color.Orange)
+                }
+            };
+            this.Controls.Add(_accelPanel);
+
+            // ======== 第二行：四元数 | 磁力计 | 气压高度 ========
+            _quatPanel = new ImuValuePanel("四元数")
+            {
+                Location = new Point(10, 180),
+                Size = new Size(330, 190),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("Qw", Color.Gold),
+                    new ImuValueRow("Qx", Color.Cyan),
+                    new ImuValueRow("Qy", Color.Lime),
+                    new ImuValueRow("Qz", Color.Orange)
+                }
+            };
+            this.Controls.Add(_quatPanel);
+
+            _magPanel = new ImuValuePanel("磁力计 (Gauss)")
+            {
+                Location = new Point(350, 180),
+                Size = new Size(330, 190),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("X", Color.Cyan),
+                    new ImuValueRow("Y", Color.Lime),
+                    new ImuValueRow("Z", Color.Orange)
+                }
+            };
+            this.Controls.Add(_magPanel);
+
+            // 气压 + IMU温度面板
+            _pressurePanel = new ImuValuePanel("气压 (hPa) / IMU温度 (°C)")
+            {
+                Location = new Point(690, 180),
+                Size = new Size(330, 90),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("气压",      Color.Cyan),
+                    new ImuValueRow("IMU温度",   Color.Gold)
+                }
+            };
+            this.Controls.Add(_pressurePanel);
+
+            _altitudePanel = new ImuValuePanel("高度 (m)")
+            {
+                Location = new Point(690, 278),
+                Size = new Size(330, 90),
+                Rows = new ImuValueRow[] {
+                    new ImuValueRow("相对高度", Color.Lime),
+                    new ImuValueRow("海拔高度", Color.Cyan)
+                }
+            };
+            this.Controls.Add(_altitudePanel);
+
+            // ======== 下半部分：时序曲线图 ========
+            _attitudeChart = new TimeSeriesChart("姿态角 (°)", 500)
+            {
+                Location = new Point(10, 380),
+                Size = new Size(500, 210),
+                Series = new[]
+                {
+                    new ChartSeries("Roll",  Color.Cyan),
+                    new ChartSeries("Pitch", Color.Lime),
+                    new ChartSeries("Yaw",   Color.Orange),
+                }
+            };
+            this.Controls.Add(_attitudeChart);
+
+            _imuChart = new TimeSeriesChart("IMU 原始数据", 500)
+            {
+                Location = new Point(520, 380),
+                Size = new Size(500, 210),
+                Series = new[]
+                {
+                    new ChartSeries("AccX",  Color.Cyan),
+                    new ChartSeries("AccY",  Color.Lime),
+                    new ChartSeries("AccZ",  Color.Orange),
+                    new ChartSeries("GyroX", Color.Magenta),
+                    new ChartSeries("GyroY", Color.Yellow),
+                    new ChartSeries("GyroZ", Color.Coral),
+                }
+            };
+            this.Controls.Add(_imuChart);
+
+            _altPressureChart = new TimeSeriesChart("气压 & 高度", 500)
+            {
+                Location = new Point(10, 600),
+                Size = new Size(1010, 180),
+                Series = new[]
+                {
+                    new ChartSeries("气压(hPa)",   Color.Cyan),
+                    new ChartSeries("相对高度(m)",  Color.Lime),
+                    new ChartSeries("海拔(m)",      Color.Orange),
+                }
+            };
+            this.Controls.Add(_altPressureChart);
+        }
+
+        // ===================== MAVLink 订阅 =====================
+        private void SubscribeMavlink()
+        {
+            try
+            {
+                if (MainV2.comPort != null)
+                {
+                    MainV2.comPort.OnPacketReceived += OnMavlinkPacket;
+                }
+            }
+            catch { /* 首次加载时 comPort 可能尚未初始化 */ }
+
+            // 如果初始订阅失败，延迟重试
+            var retryTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+            retryTimer.Tick += (s, e) =>
+            {
+                try
+                {
+                    if (MainV2.comPort != null)
+                    {
+                        MainV2.comPort.OnPacketReceived -= OnMavlinkPacket;
+                        MainV2.comPort.OnPacketReceived += OnMavlinkPacket;
+                        retryTimer.Stop();
+                        retryTimer.Dispose();
+                    }
+                }
+                catch { }
+            };
+            retryTimer.Start();
+        }
+
+        private void OnMavlinkPacket(object sender, MAVLink.MAVLinkMessage msg)
+        {
+            switch (msg.msgid)
+            {
+                case (uint)MAVLink.MAVLINK_MSG_ID.ATTITUDE:
+                {
+                    var att = (MAVLink.mavlink_attitude_t)msg.data;
+                    lock (_lock)
+                    {
+                        _roll       = att.roll  * 57.29578f;  // rad -> deg
+                        _pitch      = att.pitch * 57.29578f;
+                        _yaw        = att.yaw   * 57.29578f;
+                        _rollSpeed  = att.rollspeed;
+                        _pitchSpeed = att.pitchspeed;
+                        _yawSpeed   = att.yawspeed;
+                        _hasAttitude = true;
+                    }
+                    break;
+                }
+
+                case (uint)MAVLink.MAVLINK_MSG_ID.HIGHRES_IMU:
+                {
+                    var imu = (MAVLink.mavlink_highres_imu_t)msg.data;
+                    lock (_lock)
+                    {
+                        _accX = imu.xacc;
+                        _accY = imu.yacc;
+                        _accZ = imu.zacc;
+                        _gyroX = imu.xgyro;
+                        _gyroY = imu.ygyro;
+                        _gyroZ = imu.zgyro;
+                        _magX = imu.xmag;
+                        _magY = imu.ymag;
+                        _magZ = imu.zmag;
+                        _imuTemperature = imu.temperature;
+                        _hasHighresImu = true;
+                    }
+                    break;
+                }
+
+                case (uint)MAVLink.MAVLINK_MSG_ID.ATTITUDE_QUATERNION:
+                {
+                    var quat = (MAVLink.mavlink_attitude_quaternion_t)msg.data;
+                    lock (_lock)
+                    {
+                        _qw = quat.q1;
+                        _qx = quat.q2;
+                        _qy = quat.q3;
+                        _qz = quat.q4;
+                        _hasQuaternion = true;
+                    }
+                    break;
+                }
+
+                case (uint)MAVLink.MAVLINK_MSG_ID.SCALED_PRESSURE:
+                {
+                    var pres = (MAVLink.mavlink_scaled_pressure_t)msg.data;
+                    lock (_lock)
+                    {
+                        _pressure = pres.press_abs;
+                        _hasPressure = true;
+                    }
+                    break;
+                }
+
+                case (uint)MAVLink.MAVLINK_MSG_ID.ALTITUDE:
+                {
+                    var alt = (MAVLink.mavlink_altitude_t)msg.data;
+                    lock (_lock)
+                    {
+                        _altMonotonic = alt.altitude_monotonic;
+                        _altAmsl      = alt.altitude_amsl;
+                        _altLocal     = alt.altitude_local;
+                        _altRelative  = alt.altitude_relative;
+                        _hasAltitude  = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ===================== 定时刷新 UI =====================
+        private void OnRefresh(object sender, EventArgs e)
+        {
+            if (_chkPause.Checked) return;
+
+            float r, p, y, rs, ps, ys, ax, ay, az, gx, gy, gz, mx, my, mz;
+            float qw, qx, qy, qz, press, imuTemp, altRel, altAmsl;
+            bool hasAtt, hasQuat;
+
+            lock (_lock)
+            {
+                r = _roll;  p = _pitch;  y = _yaw;
+                rs = _rollSpeed;  ps = _pitchSpeed;  ys = _yawSpeed;
+                ax = _accX;  ay = _accY;  az = _accZ;
+                gx = _gyroX;  gy = _gyroY;  gz = _gyroZ;
+                mx = _magX;  my = _magY;  mz = _magZ;
+                qw = _qw;  qx = _qx;  qy = _qy;  qz = _qz;
+                press = _pressure;  imuTemp = _imuTemperature;
+                altRel = _altRelative;  altAmsl = _altAmsl;
+                hasAtt = _hasAttitude;
+                hasQuat = _hasQuaternion;
+            }
+
+            // 更新状态栏
+            _statusLabel.Text = hasAtt
+                ? string.Format("数据接收正常 | Roll:{0:+0.0;-0.0}° Pitch:{1:+0.0;-0.0}° Yaw:{2:+0.0;-0.0}° | IMU:{3:0.0}°C", r, p, y, imuTemp)
+                : "等待 MAVLink 数据...";
+
+            // 更新数值面板
+            _anglePanel.SetValues(new[] { r, p, y });
+            _gyroPanel.SetValues(new[] { rs, ps, ys });
+            _accelPanel.SetValues(new[] { ax, ay, az });
+            _magPanel.SetValues(new[] { mx, my, mz });
+            _quatPanel.SetValues(new[] { qw, qx, qy, qz });
+            _pressurePanel.SetValues(new[] { press, imuTemp });
+            _altitudePanel.SetValues(new[] { altRel, altAmsl });
+
+            // 更新曲线图
+            _attitudeChart.AddData(new[] { r, p, y });
+            _imuChart.AddData(new[] { ax, ay, az, gx, gy, gz });
+            _altPressureChart.AddData(new[] { press, altRel, altAmsl });
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_refreshTimer != null) _refreshTimer.Stop();
+            try { MainV2.comPort.OnPacketReceived -= OnMavlinkPacket; } catch { }
+            base.OnFormClosing(e);
+        }
+    }
+
+    // ==================================================================
+    //  数值面板 (统一风格)
+    // ==================================================================
+    public class ImuValueRow
+    {
+        public string Label;
+        public Color Color;
+        public ImuValueRow(string label, Color color) { Label = label; Color = color; }
+    }
+
+    public class ImuValuePanel : Control
+    {
+        private string _title;
+        private float[] _values = new float[0];
+        public ImuValueRow[] Rows;
+
+        public ImuValuePanel(string title)
+        {
+            _title = title;
+            this.DoubleBuffered = true;
+            this.BackColor = Color.FromArgb(50, 50, 58);
+        }
+
+        public void SetValues(float[] values)
+        {
+            _values = values;
+            this.Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            int w = this.Width, h = this.Height;
+
+            // 背景圆角矩形
+            using (var path = RoundedRect(0, 0, w, h, 8))
+            using (var bgBrush = new SolidBrush(this.BackColor))
+                g.FillPath(bgBrush, path);
+
+            // 标题
+            using (var titleFont = new Font("Segoe UI", 10, FontStyle.Bold))
+            using (var titleBrush = new SolidBrush(Color.FromArgb(180, 180, 190)))
+                g.DrawString(_title, titleFont, titleBrush, 10, 6);
+
+            // 分隔线
+            using (var pen = new Pen(Color.FromArgb(80, 80, 88), 1f))
+                g.DrawLine(pen, 10, 28, w - 10, 28);
+
+            if (Rows == null || _values.Length == 0) return;
+
+            int startY = 34;
+            int rowH = Math.Min(36, (h - startY - 4) / Math.Max(1, Rows.Length));
+
+            for (int i = 0; i < Math.Min(Rows.Length, _values.Length); i++)
+            {
+                int y = startY + i * rowH;
+                float val = _values[i];
+
+                // 标签
+                using (var font = new Font("Segoe UI", 9))
+                using (var brush = new SolidBrush(Color.FromArgb(160, 160, 170)))
+                {
+                    var sz = g.MeasureString(Rows[i].Label, font);
+                    g.DrawString(Rows[i].Label, font, brush, 10, y + (rowH - sz.Height) / 2);
+                }
+
+                // 数值
+                using (var valFont = new Font("Consolas", 14, FontStyle.Bold))
+                using (var valBrush = new SolidBrush(Rows[i].Color))
+                {
+                    string text = val.ToString("F3");
+                    var sz = g.MeasureString(text, valFont);
+                    g.DrawString(text, valFont, valBrush, w - 10 - sz.Width, y + (rowH - sz.Height) / 2);
+                }
+
+                // 进度条背景
+                int barX = 80;
+                int barW = w - 80 - 140;
+                int barY = y + rowH - 8;
+                int barH = 5;
+                if (barW > 20)
+                {
+                    using (var barBg = new SolidBrush(Color.FromArgb(60, 60, 68)))
+                        g.FillRectangle(barBg, barX, barY, barW, barH);
+
+                    float absVal = Math.Abs(val);
+                    float maxVal = 10f;
+                    // 行级特殊范围 (优先)
+                    if (Rows[i].Label.Contains("温度")) maxVal = 100f;
+                    else if (_title.Contains("角速度")) maxVal = 6.28f;
+                    else if (_title.Contains("加速度")) maxVal = 20f;
+                    else if (_title.Contains("欧拉角") || _title.Contains("姿态")) maxVal = 180f;
+                    else if (_title.Contains("四元数")) maxVal = 1f;
+                    else if (_title.Contains("气压")) maxVal = 2000f;
+                    else if (_title.Contains("高度")) maxVal = 500f;
+                    else if (_title.Contains("磁力计")) maxVal = 2f;
+
+                    int fillW = (int)(Math.Min(absVal, maxVal) / maxVal * barW);
+                    using (var fillBrush = new SolidBrush(Color.FromArgb(80, Rows[i].Color)))
+                        g.FillRectangle(fillBrush, barX, barY, fillW, barH);
+                }
+            }
+        }
+
+        private GraphicsPath RoundedRect(int x, int y, int w, int h, int r)
+        {
+            var path = new GraphicsPath();
+            int d = r * 2;
+            path.AddArc(x, y, d, d, 180, 90);
+            path.AddArc(x + w - d, y, d, d, 270, 90);
+            path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            path.AddArc(x, y + h - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    // ==================================================================
+    //  时序曲线图 (GDI+ 自绘)
+    // ==================================================================
+    public class ChartSeries
+    {
+        public string Name;
+        public Color  Color;
+        public bool   Visible = true;
+        public ChartSeries(string name, Color color) { Name = name; Color = color; }
+    }
+
+    public class TimeSeriesChart : Control
+    {
+        private readonly string _title;
+        private readonly int _maxPoints;
+        private Queue<float[]> _buffer = new Queue<float[]>();
+        public ChartSeries[] Series;
+
+        public TimeSeriesChart(string title, int maxPoints)
+        {
+            _title = title;
+            _maxPoints = maxPoints;
+            this.DoubleBuffered = true;
+            this.BackColor = Color.FromArgb(50, 50, 58);
+        }
+
+        public void AddData(float[] values)
+        {
+            _buffer.Enqueue(values);
+            while (_buffer.Count > _maxPoints)
+                _buffer.Dequeue();
+            this.Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            int w = this.Width, h = this.Height;
+
+            // 背景
+            using (var path = RoundedRect(0, 0, w, h, 8))
+            using (var bgBrush = new SolidBrush(this.BackColor))
+                g.FillPath(bgBrush, path);
+
+            // 标题
+            using (var font = new Font("Segoe UI", 10, FontStyle.Bold))
+            using (var brush = new SolidBrush(Color.FromArgb(180, 180, 190)))
+                g.DrawString(_title, font, brush, 10, 6);
+
+            // 图例 (显示序列名)
+            if (Series != null)
+            {
+                int lx = w - 10;
+                using (var legendFont = new Font("Segoe UI", 7.5f))
+                {
+                    for (int i = Series.Length - 1; i >= 0; i--)
+                    {
+                        string text = Series[i].Name;
+                        var sz = g.MeasureString(text, legendFont);
+                        lx -= (int)sz.Width + 18;
+                        // 如果该序列被禁用，则使用灰色点和文本
+                        Color dotColor = Series[i].Visible ? Series[i].Color : Color.FromArgb(90, 90, 95);
+                        Color textColor = Series[i].Visible ? Series[i].Color : Color.FromArgb(110, 110, 115);
+                        using (var dotBrush = new SolidBrush(dotColor))
+                            g.FillEllipse(dotBrush, lx + 2, 9, 7, 7);
+                        using (var textBrush = new SolidBrush(textColor))
+                            g.DrawString(text, legendFont, textBrush, lx + 12, 8);
+                    }
+                }
+            }
+
+            // 绘图区域
+            int marginLeft = 45, marginRight = 15, marginTop = 32, marginBottom = 20;
+            int plotW = w - marginLeft - marginRight;
+            int plotH = h - marginTop - marginBottom;
+
+            if (plotW <= 0 || plotH <= 0 || _buffer.Count < 2 || Series == null) return;
+
+            // 边框
+            using (var pen = new Pen(Color.FromArgb(70, 70, 78), 1f))
+            {
+                g.DrawRectangle(pen, marginLeft, marginTop, plotW, plotH);
+            }
+
+            // 网格线
+            using (var gridPen = new Pen(Color.FromArgb(45, 45, 52), 0.5f))
+            {
+                for (int i = 1; i <= 3; i++)
+                {
+                    int gy = marginTop + plotH * i / 4;
+                    g.DrawLine(gridPen, marginLeft, gy, marginLeft + plotW, gy);
+                }
+            }
+
+            // 计算 Y 轴范围
+            float yMin = float.MaxValue, yMax = float.MinValue;
+            foreach (var arr in _buffer)
+                foreach (var v in arr)
+                {
+                    if (v < yMin) yMin = v;
+                    if (v > yMax) yMax = v;
+                }
+            if (Math.Abs(yMax - yMin) < 0.001f) { yMin -= 1; yMax += 1; }
+            float yRange = yMax - yMin;
+            yMin -= yRange * 0.05f;
+            yMax += yRange * 0.05f;
+            yRange = yMax - yMin;
+
+            // Y 轴标签
+            using (var labelFont = new Font("Segoe UI", 7))
+            using (var labelBrush = new SolidBrush(Color.FromArgb(140, 140, 150)))
+            {
+                for (int i = 0; i <= 4; i++)
+                {
+                    float val = yMax - yRange * i / 4;
+                    string text = val.ToString("F1");
+                    var sz = g.MeasureString(text, labelFont);
+                    int yPos = marginTop + plotH * i / 4;
+                    g.DrawString(text, labelFont, labelBrush, marginLeft - sz.Width - 4, yPos - sz.Height / 2);
+                }
+            }
+
+            // 绘制曲线
+            float[][] history = _buffer.ToArray();
+            int count = history.Length;
+
+            if (Series != null)
+            {
+                for (int s = 0; s < Series.Length; s++)
+                {
+                    if (!Series[s].Visible) continue;
+                    if (s >= history[0].Length) continue;
+
+                    var pts = new PointF[count];
+                    for (int i = 0; i < count; i++)
+                    {
+                        float x = marginLeft + (float)i / (_maxPoints - 1) * plotW;
+                        float y = marginTop + plotH - (history[i][s] - yMin) / yRange * plotH;
+                        pts[i] = new PointF(x, y);
+                    }
+
+                    using (var pen = new Pen(Series[s].Color, 1.5f))
+                        g.DrawLines(pen, pts);
+                }
+            }
+
+            // 最新值
+            if (count > 0 && Series != null)
+            {
+                var latest = history[count - 1];
+                using (var valFont = new Font("Consolas", 8))
+                {
+                    for (int s = 0; s < Math.Min(Series.Length, latest.Length); s++)
+                    {
+                        if (!Series[s].Visible) continue;
+                        float y = marginTop + plotH - (latest[s] - yMin) / yRange * plotH;
+                        using (var brush = new SolidBrush(Series[s].Color))
+                        {
+                            g.FillEllipse(brush, marginLeft + plotW - 4, y - 3, 7, 7);
+                        }
+                    }
+                }
+            }
+        }
+
+        private GraphicsPath RoundedRect(int x, int y, int w, int h, int r)
+        {
+            var path = new GraphicsPath();
+            int d = r * 2;
+            path.AddArc(x, y, d, d, 180, 90);
+            path.AddArc(x + w - d, y, d, d, 270, 90);
+            path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            path.AddArc(x, y + h - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+}
