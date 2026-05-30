@@ -696,16 +696,6 @@
               <FilePath>..\Hardware\imu_simulator.h</FilePath>
             </File>
             <File>
-              <FileName>debug_output.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Hardware\debug_output.c</FilePath>
-            </File>
-            <File>
-              <FileName>debug_output.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Hardware\debug_output.h</FilePath>
-            </File>
-            <File>
               <FileName>wit_c_sdk.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Hardware\wit_c_sdk.c</FilePath>

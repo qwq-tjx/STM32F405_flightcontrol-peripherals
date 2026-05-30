@@ -751,107 +751,113 @@ void WitImu_GetData(WitImuData_t *pData)
     
     if(pData == NULL) return;
     
-    // 原子性读取更新标志，避免数据竞争
-    uiDataUpdate = s_uiDataUpdate;
+    // sReg 快照变量 — 在临界区内从 sReg[] 一次性拷贝，防止 UART5 ISR 撕裂
+    short snapAX=0, snapAY=0, snapAZ=0;
+    short snapGX=0, snapGY=0, snapGZ=0;
+    short snapRoll=0, snapPitch=0, snapYaw=0;
+    short snapHX=0, snapHY=0, snapHZ=0;
+    short snapQ0=0, snapQ1=0, snapQ2=0, snapQ3=0;
+    short snapPressL=0, snapPressH=0, snapHeightL=0, snapHeightH=0;
+    short snapTemp=0;
     
-    // 处理传感器数据更新
+    // ===== 临界区: 原子性读取标志 + 快照全部 sReg[] =====
+    __disable_irq();
+    
+    uiDataUpdate = s_uiDataUpdate;
+    s_uiDataUpdate = 0;
+    
+    // 根据标志选择性快照，避免拷贝不需要的数据
+    if(uiDataUpdate & FLAG_ACC) {
+        snapAX = sReg[AX]; snapAY = sReg[AY]; snapAZ = sReg[AZ];
+    }
+    if(uiDataUpdate & FLAG_GYRO) {
+        snapGX = sReg[GX]; snapGY = sReg[GY]; snapGZ = sReg[GZ];
+    }
+    if(uiDataUpdate & FLAG_ANGLE) {
+        snapRoll = sReg[Roll]; snapPitch = sReg[Pitch]; snapYaw = sReg[Yaw];
+    }
+    if(uiDataUpdate & FLAG_MAG) {
+        snapHX = sReg[HX]; snapHY = sReg[HY]; snapHZ = sReg[HZ];
+    }
+    if(uiDataUpdate & FLAG_QUATERNION) {
+        snapQ0 = sReg[q0]; snapQ1 = sReg[q1]; snapQ2 = sReg[q2]; snapQ3 = sReg[q3];
+    }
+    if(uiDataUpdate & FLAG_PRESS) {
+        snapPressL  = sReg[PressureL]; snapPressH  = sReg[PressureH];
+        snapHeightL = sReg[HeightL];   snapHeightH = sReg[HeightH];
+    }
+    if(uiDataUpdate & FLAG_TEMP) {
+        snapTemp = sReg[TEMP];
+    }
+    
+    __enable_irq();
+    // ===== 临界区结束，后续所有计算使用本地快照 =====
+    
     if(uiDataUpdate)
     {
         // 加速度数据
         if(uiDataUpdate & FLAG_ACC)
         {
-            // 一次性读取所有加速度值，确保一致性
-            short accX = sReg[AX];
-            short accY = sReg[AY];
-            short accZ = sReg[AZ];
-            
-            s_tImuData.acc[0] = accX / 32768.0f * 16.0f;
-            s_tImuData.acc[1] = accY / 32768.0f * 16.0f;
-            s_tImuData.acc[2] = accZ / 32768.0f * 16.0f;
+            s_tImuData.acc[0] = snapAX / 32768.0f * 16.0f;
+            s_tImuData.acc[1] = snapAY / 32768.0f * 16.0f;
+            s_tImuData.acc[2] = snapAZ / 32768.0f * 16.0f;
             s_tImuData.acc_updated = 1;
         }
         
         // 角速度数据
         if(uiDataUpdate & FLAG_GYRO)
         {
-            // 一次性读取所有角速度值，确保一致性
-            short gyroX = sReg[GX];
-            short gyroY = sReg[GY];
-            short gyroZ = sReg[GZ];
-            
-            s_tImuData.gyro[0] = gyroX / 32768.0f * 2000.0f;
-            s_tImuData.gyro[1] = gyroY / 32768.0f * 2000.0f;
-            s_tImuData.gyro[2] = gyroZ / 32768.0f * 2000.0f;
+            s_tImuData.gyro[0] = snapGX / 32768.0f * 2000.0f;
+            s_tImuData.gyro[1] = snapGY / 32768.0f * 2000.0f;
+            s_tImuData.gyro[2] = snapGZ / 32768.0f * 2000.0f;
             s_tImuData.gyro_updated = 1;
         }
         
         // 角度数据
         if(uiDataUpdate & FLAG_ANGLE)
         {
-            // 一次性读取所有角度值，确保一致性
-            short rawRoll = sReg[Roll];
-            short rawPitch = sReg[Pitch];
-            short rawYaw = sReg[Yaw];
-            
-            s_tImuData.angle[0] = rawRoll / 32768.0f * 180.0f;
-            s_tImuData.angle[1] = rawPitch / 32768.0f * 180.0f;
-            s_tImuData.angle[2] = rawYaw / 32768.0f * 180.0f;
+            s_tImuData.angle[0] = snapRoll / 32768.0f * 180.0f;
+            s_tImuData.angle[1] = snapPitch / 32768.0f * 180.0f;
+            s_tImuData.angle[2] = snapYaw / 32768.0f * 180.0f;
             s_tImuData.angle_updated = 1;
         }
         
         // 磁场数据
         if(uiDataUpdate & FLAG_MAG)
         {
-            // 一次性读取所有磁场值，确保一致性
-            short magX = sReg[HX];
-            short magY = sReg[HY];
-            short magZ = sReg[HZ];
-            
-            s_tImuData.mag[0] = magX / 10.0f;  // 原始数据单位 0.1mT，转换为 mT
-            s_tImuData.mag[1] = magY / 10.0f;
-            s_tImuData.mag[2] = magZ / 10.0f;
+            s_tImuData.mag[0] = snapHX / 10.0f;  // 原始数据单位 0.1mT，转换为 mT
+            s_tImuData.mag[1] = snapHY / 10.0f;
+            s_tImuData.mag[2] = snapHZ / 10.0f;
             s_tImuData.mag_updated = 1;
         }
         
         // 四元数数据
         if(uiDataUpdate & FLAG_QUATERNION)
         {
-            short raw_q0 = sReg[q0];
-            short raw_q1 = sReg[q1];
-            short raw_q2 = sReg[q2];
-            short raw_q3 = sReg[q3];
-            
-            s_tImuData.quat[0] = raw_q0 / 32768.0f;  // w
-            s_tImuData.quat[1] = raw_q1 / 32768.0f;  // x
-            s_tImuData.quat[2] = raw_q2 / 32768.0f;  // y
-            s_tImuData.quat[3] = raw_q3 / 32768.0f;  // z
+            s_tImuData.quat[0] = snapQ0 / 32768.0f;  // w
+            s_tImuData.quat[1] = snapQ1 / 32768.0f;  // x
+            s_tImuData.quat[2] = snapQ2 / 32768.0f;  // y
+            s_tImuData.quat[3] = snapQ3 / 32768.0f;  // z
             s_tImuData.quat_updated = 1;
         }
         
         // 气压数据 (含高度) — 32-bit 值，高低 16 位分存
         if(uiDataUpdate & FLAG_PRESS)
         {
-            // PressureL(0x45)=低16位, PressureH(0x46)=高16位 → 32-bit 气压 (Pa 或 0.01hPa)
-            int32_t rawPressure = ((int32_t)(uint16_t)sReg[PressureH] << 16) | (uint16_t)sReg[PressureL];
-            // HeightL(0x47)=低16位, HeightH(0x48)=高16位 → 32-bit 高度 (cm)
-            int32_t rawAltitude = ((int32_t)(uint16_t)sReg[HeightH]  << 16) | (uint16_t)sReg[HeightL];
+            int32_t rawPressure = ((int32_t)(uint16_t)snapPressH << 16) | (uint16_t)snapPressL;
+            int32_t rawAltitude = ((int32_t)(uint16_t)snapHeightH << 16) | (uint16_t)snapHeightL;
             
             s_tImuData.pressure = rawPressure / 100.0f;   // → hPa
             s_tImuData.altitude = rawAltitude / 100.0f;   // → m
             s_tImuData.pressure_updated = 1;
         }
         
-        // 芯片温度数据 — 随加速度包一起到达 (TEMP 寄存器, 0x40)
+        // 芯片温度数据
         if(uiDataUpdate & FLAG_TEMP)
         {
-            // raw 单位为 0.01°C，除以 100 得到 °C
-            short rawTemp = sReg[TEMP];
-            s_tImuData.temperature = rawTemp / 100.0f;
+            s_tImuData.temperature = snapTemp / 100.0f;
             s_tImuData.temperature_updated = 1;
         }
-        
-        // 清除更新标志
-        s_uiDataUpdate = 0;
     }
     
     // 复制数据到用户缓冲区

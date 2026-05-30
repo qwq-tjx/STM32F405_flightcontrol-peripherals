@@ -3,8 +3,10 @@
 #include "Delay.h"
 
 // ==================== 静态变量 ====================
-// 当前四个通道的油门值 (0-4095)
+// 临界区 PRIMASK 保存变量 (DSHOT_ENTER_CRITICAL/EXIT_CRITICAL 使用)
+uint32_t __dshot_crit_primask = 0;
 
+// 当前四个通道的油门值 (0-4095)
 volatile uint16_t current_throttle[4] = {0, 0, 0, 0};
 
 // DMA缓冲区（外部可访问，用于测试）
@@ -55,8 +57,8 @@ static void DShot_FillDMABuffer(uint32_t *buf, uint16_t frame, uint8_t channel)
 // 初始化DSHOT模块 (TIM8和DMA配置)
 void DShot_Init(void)
 {
-    // 1. 初始化TIM8 PWM (ARR=559, PSC=1)
-    TIM8_PWM_Init(560-1, 1);
+    // 1. 初始化TIM8 PWM (ARR=559, PSC=19 → 8.4MHz, DSHOT15)
+    TIM8_PWM_Init(560-1, 19);
     
     // 2. 初始化DMA缓冲区（全部为0油门）
     DShot_FillDMABuffer(dshot_dma_buffer_ch1, DShot_BuildFrame(0), 0);

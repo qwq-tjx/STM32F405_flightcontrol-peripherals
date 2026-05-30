@@ -4,25 +4,18 @@
 #include "stm32f4xx.h"
 
 // ==================== 临界区保护宏 ====================
-#define DSHOT_ENTER_CRITICAL()  do { __set_PRIMASK(1); } while(0)  // 关闭全局中断
-#define DSHOT_EXIT_CRITICAL()   do { __set_PRIMASK(0); } while(0)  // 恢复全局中断
+// 保存/恢复 PRIMASK，防止错误地在中断已关闭的上下文中重新开中断
+// 注意: 不可嵌套使用（如需嵌套请使用 _unsafe 版本函数）
+extern uint32_t __dshot_crit_primask;
+#define DSHOT_ENTER_CRITICAL()  do { __dshot_crit_primask = __get_PRIMASK(); __disable_irq(); } while(0)
+#define DSHOT_EXIT_CRITICAL()   do { if (!__dshot_crit_primask) __enable_irq(); } while(0)
 
 // 缓冲区长度
 #define ESC_CMD_BUFFER_LEN     18    // 16数据 + 2位纯低电平
 
-// DSHOT时序参数 (DSHOT300)
+// DSHOT时序参数 (DSHOT15, PSC=19 → 66.67µs/bit)
 #define DSHOT_BIT0             208   // 52*4
 #define DSHOT_BIT1             420   // 105*4
-static uint8_t Custom_CRC4(uint16_t data_12bit);
-
-
-// 构建16位帧: 12位油门 + 4位CRC
-static uint16_t DShot_BuildFrame(uint16_t throttle);
-
-
-// 填充DMA缓冲区（为不同通道添加微小延迟，减少同时翻转）
-static void DShot_FillDMABuffer(uint32_t *buf, uint16_t frame, uint8_t channel);
-
 
 // ==================== 外部接口函数 ====================
 
@@ -53,6 +46,7 @@ uint8_t DShot_UpdateSingleChannel(uint8_t channel, uint16_t throttle);
 void DShot_RestartDMAChannel(uint8_t channel);
 
 extern volatile uint16_t current_throttle[4];
+extern volatile uint8_t  serial_throttle_updated;  // 串口调试标志：1=有新油门值待更新到DMA
 
 // DMA缓冲区（用于测试或调试）
 extern uint32_t dshot_dma_buffer_ch1[18];

@@ -2,6 +2,16 @@
 #define __SERIAL_H
 
 #include <stdio.h>
+#include "stm32f4xx.h"
+
+/* 辅助函数: 16位值转二进制字符串 (static 每个编译单元持有独立副本) */
+static void fmt_bin16(uint16_t v, char *buf)
+{
+    for (int8_t i = 15; i >= 0; i--) {
+        buf[15 - i] = (v & ((uint16_t)1 << i)) ? '1' : '0';
+    }
+    buf[16] = '\0';
+}
 
 void USART1_Init(void);
 void Serial_SendByte(uint8_t Byte);

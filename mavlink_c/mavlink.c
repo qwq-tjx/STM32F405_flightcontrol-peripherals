@@ -4,10 +4,21 @@
 #include "DSHOT.h"
 #include "wit_c_sdk.h"
 #include "LED.h"
+#include "control.h"
 
-// 临界区保护宏（与 DSHOT 保持一致）
-#define THROTTLE_ENTER_CRITICAL()  do { __set_PRIMASK(1); } while(0)
-#define THROTTLE_EXIT_CRITICAL()   do { __set_PRIMASK(0); } while(0)
+// ========== DSHOT 电机油门值（来自 DSHOT.c） ==========
+extern volatile uint16_t current_throttle[4];
+
+// ========== 控制目标值 (MAVLink接收 → PID使用) ==========
+volatile float  target_angle[3] = {0.0f, 0.0f, 0.0f};
+volatile float  target_gyro[3]  = {0.0f, 0.0f, 0.0f};
+volatile uint8_t control_mode   = CTRL_MODE_DISABLED;
+
+// 临界区保护宏（保存/恢复 PRIMASK，防嵌套误开中断）
+// 注意: 不可嵌套使用（如需嵌套请使用 _unsafe 版本函数）
+static uint32_t __throttle_crit_primask = 0;
+#define THROTTLE_ENTER_CRITICAL()  do { __throttle_crit_primask = __get_PRIMASK(); __disable_irq(); } while(0)
+#define THROTTLE_EXIT_CRITICAL()   do { if (!__throttle_crit_primask) __enable_irq(); } while(0)
 
 // 定义圆周率常量
 #ifndef M_PI
@@ -25,6 +36,7 @@ typedef struct {
 static throttle_cmd_t cmd_queue[THROTTLE_CMD_QUEUE_SIZE];
 static volatile uint16_t cmd_head = 0;
 static volatile uint16_t cmd_tail = 0;
+
 
 uint8_t throttle_cmd_enqueue(uint8_t channel, uint16_t value)
 {
@@ -69,6 +81,18 @@ uint8_t throttle_cmd_dequeue(uint8_t *channel, uint16_t *value)
     return result;
 }
 
+/* 非临界区版本: 调用者必须确保已在临界区内 (避免嵌套 EXIT_CRITICAL 过早开中断) */
+uint8_t throttle_cmd_dequeue_unsafe(uint8_t *channel, uint16_t *value)
+{
+    if (cmd_head == cmd_tail) {
+        return 0;
+    }
+    *channel = cmd_queue[cmd_tail].channel;
+    *value   = cmd_queue[cmd_tail].value;
+    cmd_tail = (cmd_tail + 1) % THROTTLE_CMD_QUEUE_SIZE;
+    return 1;
+}
+
 uint8_t throttle_cmd_available(void)
 {
     int16_t count;
@@ -80,6 +104,14 @@ uint8_t throttle_cmd_available(void)
     return (uint8_t)count;
 }
 
+/* 非临界区版本: 调用者必须确保已在临界区内 */
+uint8_t throttle_cmd_available_unsafe(void)
+{
+    int16_t count;
+    count = (cmd_head - cmd_tail + THROTTLE_CMD_QUEUE_SIZE) % THROTTLE_CMD_QUEUE_SIZE;
+    return (uint8_t)count;
+}
+
 // MAVLink 系统ID配置
 mavlink_system_t mavlink_system = {
     .sysid = 1,
@@ -88,9 +120,8 @@ mavlink_system_t mavlink_system = {
 
 // ========== IMU 数据发送间隔配置 ==========
 static uint32_t attitude_interval_us = 100000;  // ATTITUDE 默认 10Hz
-static uint32_t imu_hres_interval_us = 100000; // HIGHRES_IMU 默认 10Hz
 static volatile uint8_t attitude_stream_enabled = 1;
-
+static uint32_t imu_hres_interval_us = 100000; 
 // ========== 发送 IMU 姿态数据 (ATTITUDE 消息) ==========
 void mavlink_send_imu_attitude(WitImuData_t *imu_data)
 {
@@ -262,6 +293,37 @@ void mavlink_send_imu_altitude(WitImuData_t *imu_data)
     mavlink_send_message(&msg);
 }
 
+// ========== 发送舵机/电机输出值 (SERVO_OUTPUT_RAW 消息) ==========
+void mavlink_send_servo_output(void)
+{
+    mavlink_message_t msg;
+    uint32_t time_us = delay_ms_count_get() * 1000UL;
+
+    // 禁止中断，原子读取 4 个通道的油门值
+    volatile uint32_t m1, m2, m3, m4;
+    THROTTLE_ENTER_CRITICAL();
+    m1 = current_throttle[0];
+    m2 = current_throttle[1];
+    m3 = current_throttle[2];
+    m4 = current_throttle[3];
+    THROTTLE_EXIT_CRITICAL();
+
+    mavlink_msg_servo_output_raw_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_us,
+        0,                                  // port (0 = main)
+        (uint16_t)m1, (uint16_t)m2,        // servo1_raw, servo2_raw (电机1,2 → PWM值)
+        (uint16_t)m3, (uint16_t)m4,        // servo3_raw, servo4_raw (电机3,4 → PWM值)
+        0, 0, 0, 0,                        // servo5-8_raw
+        0, 0, 0, 0,                        // servo9-12_raw
+        0, 0, 0, 0                         // servo13-16_raw
+    );
+
+    mavlink_send_message(&msg);
+}
+
 // ========== 主动发送 IMU 数据的主函数 (定时器中断中调用) ==========
 // 交错发送: 偶数轮发气压+高度, 奇数轮发ScaledIMU+姿态
 // 每组 ~70B, 115200下 6ms → 100Hz循环有充足余量, 每条消息有效50Hz
@@ -269,6 +331,7 @@ void mavlink_send_imu_periodic(void)
 {
     static uint32_t last_attitude_time = 0;
     static uint32_t last_heartbeat_time = 0;
+    static uint32_t last_servo_time = 0;
     static uint8_t  msg_phase = 0;
     uint32_t current_time = delay_ms_count_get();
 
@@ -277,6 +340,12 @@ void mavlink_send_imu_periodic(void)
         last_heartbeat_time = current_time;
         mavlink_send_heartbeat();
         LED_heartbeat_sync();  // LED闪烁与心跳同频同步
+    }
+
+    // ========== 伺服输出：每500ms发1次 (2Hz) ==========
+    if (current_time - last_servo_time >= 500) {
+        last_servo_time = current_time;
+        mavlink_send_servo_output();
     }
 
     if (attitude_stream_enabled) {
@@ -360,13 +429,25 @@ static void process_mavlink_message(mavlink_message_t *msg)
             
             // controls[0-3]: roll, pitch, yaw, throttle (归一化 -1 ~ 1)
             // controls[4-7]: 其他通道
+            uint16_t act_thr[4];
             for (uint8_t i = 0; i < 4; i++) {
                 float v = act.controls[i];
-                if (v < 0) v = 0;  // 负值设为0 (电机不支持反转)
-                uint16_t throttle = (uint16_t)(v * 4095);
-                if (throttle > 4095) throttle = 4095;
+                if (v < 0.0f)      v = 0.0f;       // 负值设为0 (电机不支持反转)
+                if (v > 1.0f)      v = 1.0f;       // 截断上界，防止溢出
+                uint16_t throttle = (uint16_t)(v * 4095.0f);
+                act_thr[i] = throttle;
                 throttle_cmd_enqueue(i, throttle);
             }
+            // 打印油门值、DSHOT帧及二进制
+            uint16_t f0, f1, f2, f3;
+            char b0[17], b1[17], b2[17], b3[17];
+            f0 = (act_thr[0] << 4) | (((act_thr[0]>>8)&0x0F) + ((act_thr[0]>>4)&0x0F) + (act_thr[0]&0x0F)) & 0x0F;
+            f1 = (act_thr[1] << 4) | (((act_thr[1]>>8)&0x0F) + ((act_thr[1]>>4)&0x0F) + (act_thr[1]&0x0F)) & 0x0F;
+            f2 = (act_thr[2] << 4) | (((act_thr[2]>>8)&0x0F) + ((act_thr[2]>>4)&0x0F) + (act_thr[2]&0x0F)) & 0x0F;
+            f3 = (act_thr[3] << 4) | (((act_thr[3]>>8)&0x0F) + ((act_thr[3]>>4)&0x0F) + (act_thr[3]&0x0F)) & 0x0F;
+            fmt_bin16(f0, b0); fmt_bin16(f1, b1); fmt_bin16(f2, b2); fmt_bin16(f3, b3);
+            Serial_Printf("[THR] ACT: %d %d %d %d\r\n", act_thr[0], act_thr[1], act_thr[2], act_thr[3]);
+            Serial_Printf("          BIN: %s %s %s %s\r\n", b0, b1, b2, b3);
             break;
         }
         
@@ -385,37 +466,76 @@ static void process_mavlink_message(mavlink_message_t *msg)
             // 将其转换为 DShot 油门值 (0-4095)
             
             // 通道1-4 对应电机0-3
-            uint8_t updated = 0;
+            uint16_t rc_thr[4] = {0, 0, 0, 0};
             if (rc.chan1_raw != UINT16_MAX && rc.chan1_raw > 900) {
-                uint16_t t = (rc.chan1_raw - 1000) * 4096 / 1000;
+                uint16_t t = (rc.chan1_raw - 1000) * 4095 / 1000;
                 if (t > 4095) t = 4095;
+                rc_thr[0] = t;
                 throttle_cmd_enqueue(0, t);
-                updated = 1;
             }
             if (rc.chan2_raw != UINT16_MAX && rc.chan2_raw > 900) {
-                uint16_t t = (rc.chan2_raw - 1000) * 4096 / 1000;
+                uint16_t t = (rc.chan2_raw - 1000) * 4095 / 1000;
                 if (t > 4095) t = 4095;
+                rc_thr[1] = t;
                 throttle_cmd_enqueue(1, t);
-                updated = 1;
             }
             if (rc.chan3_raw != UINT16_MAX && rc.chan3_raw > 900) {
-                uint16_t t = (rc.chan3_raw - 1000) * 4096 / 1000;
+                uint16_t t = (rc.chan3_raw - 1000) * 4095 / 1000;
                 if (t > 4095) t = 4095;
+                rc_thr[2] = t;
                 throttle_cmd_enqueue(2, t);
-                updated = 1;
             }
             if (rc.chan4_raw != UINT16_MAX && rc.chan4_raw > 900) {
-                uint16_t t = (rc.chan4_raw - 1000) * 4096 / 1000;
+                uint16_t t = (rc.chan4_raw - 1000) * 4095 / 1000;
                 if (t > 4095) t = 4095;
+                rc_thr[3] = t;
                 throttle_cmd_enqueue(3, t);
-                updated = 1;
+            }
+            uint16_t f0, f1, f2, f3;
+            char b0[17], b1[17], b2[17], b3[17];
+            f0 = (rc_thr[0] << 4) | (((rc_thr[0]>>8)&0x0F) + ((rc_thr[0]>>4)&0x0F) + (rc_thr[0]&0x0F)) & 0x0F;
+            f1 = (rc_thr[1] << 4) | (((rc_thr[1]>>8)&0x0F) + ((rc_thr[1]>>4)&0x0F) + (rc_thr[1]&0x0F)) & 0x0F;
+            f2 = (rc_thr[2] << 4) | (((rc_thr[2]>>8)&0x0F) + ((rc_thr[2]>>4)&0x0F) + (rc_thr[2]&0x0F)) & 0x0F;
+            f3 = (rc_thr[3] << 4) | (((rc_thr[3]>>8)&0x0F) + ((rc_thr[3]>>4)&0x0F) + (rc_thr[3]&0x0F)) & 0x0F;
+            fmt_bin16(f0, b0); fmt_bin16(f1, b1); fmt_bin16(f2, b2); fmt_bin16(f3, b3);
+//            Serial_Printf("[THR] RC: %d %d %d %d  (PWM:%d %d %d %d)\r\n",
+//                rc_thr[0], rc_thr[1], rc_thr[2], rc_thr[3],
+//                rc.chan1_raw, rc.chan2_raw, rc.chan3_raw, rc.chan4_raw);
+//            Serial_Printf("         BIN: %s %s %s %s\r\n", b0, b1, b2, b3);
+            
+            break;
+        }
+        
+        // ========== 接收目标姿态/角速度 (DEBUG_FLOAT_ARRAY, msgid=350) ==========
+        case MAVLINK_MSG_ID_DEBUG_FLOAT_ARRAY:
+        {
+            mavlink_debug_float_array_t dbg;
+            mavlink_msg_debug_float_array_decode(msg, &dbg);
+            
+            // 始终进入姿态控制模式 (同时使用角度外环+角速度内环)
+            control_mode = CTRL_MODE_ATTITUDE;
+            
+            // 目标角度 (弧度, 限幅 ±3.15 ≈ ±180.5°)
+            for (uint8_t i = 0; i < 3; i++) {
+                float v = dbg.data[i];
+                if (v > 3.15f) v = 3.15f;
+                if (v < -3.15f) v = -3.15f;
+                target_angle[i] = v;
             }
             
-            // 调试输出 (可以用串口查看)
-            if (updated) {
-                Serial_Printf("[RC] RC: %d %d %d %d\r\n", 
-                    rc.chan1_raw, rc.chan2_raw, rc.chan3_raw, rc.chan4_raw);
+            // 目标角速度 (rad/s, 限幅 ±34.9 ≈ ±2000°/s)
+            for (uint8_t i = 0; i < 3; i++) {
+                float v = dbg.data[i + 3];
+                if (v > 34.9f) v = 34.9f;
+                if (v < -34.9f) v = -34.9f;
+                target_gyro[i] = v;
             }
+            
+            // 打印目标值到串口助手
+            Serial_Printf("[TGT] ang(deg):%.1f %.1f %.1f gyr(deg/s):%.1f %.1f %.1f\r\n",
+                target_angle[0] * 57.29578f, target_angle[1] * 57.29578f, target_angle[2] * 57.29578f,
+                target_gyro[0]  * 57.29578f, target_gyro[1]  * 57.29578f, target_gyro[2]  * 57.29578f);
+            
             break;
         }
         
@@ -461,24 +581,16 @@ static void process_mavlink_message(mavlink_message_t *msg)
                         if (motor_idx < 4) {
                             if (servo_value > 4095) servo_value = 4095;
                             throttle_cmd_enqueue(motor_idx, servo_value);
-                            // 计算DSHOT CRC
-                            uint8_t g1 = (servo_value >> 8) & 0x0F;
-                            uint8_t g2 = (servo_value >> 4) & 0x0F;
-                            uint8_t g3 = servo_value & 0x0F;
-                            uint8_t crc = (g1 + g2 + g3) & 0x0F;
-                            uint16_t frame = (servo_value << 4) | crc;
-                            // 打印信息
-                            Serial_Printf("[RCV] ch=%d throttle=%d motor=%d\r\n", servo_channel, servo_value, motor_idx);
-                          //  Serial_Printf("[RCV] DSHOT frame: ");
-							//打印油门值二进制
-                            for (int i = 15; i >= 0; i--) Serial_Printf("%d", (frame >> i) & 1);
-                            Serial_Printf("\r\n");
-							
+                            uint16_t f = (servo_value << 4) | (((servo_value>>8)&0x0F) + ((servo_value>>4)&0x0F) + (servo_value&0x0F)) & 0x0F;
+                            char b[17]; fmt_bin16(f, b);
+                            Serial_Printf("[THR] SERVO ch%d=%d  BIN=%s\r\n", motor_idx + 1, servo_value, b);
                         } else if (servo_channel == 0xFF) {
                             for (uint8_t i = 0; i < 4; i++) {
                                 throttle_cmd_enqueue(i, servo_value);
                             }
-                            Serial_Printf("[RCV] all sync=%d\r\n", servo_value);
+                            uint16_t f = (servo_value << 4) | (((servo_value>>8)&0x0F) + ((servo_value>>4)&0x0F) + (servo_value&0x0F)) & 0x0F;
+                            char b[17]; fmt_bin16(f, b);
+                            Serial_Printf("[THR] SERVO all=%d  BIN=%s\r\n", servo_value, b);
                         }
                         
                         {
@@ -539,7 +651,7 @@ static void process_mavlink_message(mavlink_message_t *msg)
                         uint16_t msg_id = (uint16_t)cmd.param1;
                         int32_t interval_us = (int32_t)cmd.param2;
                         uint8_t result = MAV_RESULT_ACCEPTED;
-                        
+
                         if (interval_us > 0) {
                             switch (msg_id) {
                                 case MAVLINK_MSG_ID_ATTITUDE:
@@ -552,6 +664,10 @@ static void process_mavlink_message(mavlink_message_t *msg)
                                 case MAVLINK_MSG_ID_HIGHRES_IMU:
                                 case MAVLINK_MSG_ID_SCALED_IMU:
                                     imu_hres_interval_us = (uint32_t)interval_us;
+                                    attitude_stream_enabled = 1;
+                                    break;
+                                case MAVLINK_MSG_ID_SERVO_OUTPUT_RAW:
+                                    // 伺服输出默认 2Hz 自动发送，这里确认并回复 accepted
                                     attitude_stream_enabled = 1;
                                     break;
                                 default:

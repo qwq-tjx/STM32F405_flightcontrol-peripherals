@@ -132,8 +132,6 @@ void ADC_Config(void)
     /* ========== 10. 启动连续转换 ========== */
     ADC_SoftwareStartConv(ADC1);          /* 软件触发，开始连续转换 */
 
-    /* ========== 调试信息 ========== */
-    Serial_Printf("ADC DMA initialized\r\n");
 }
 
 

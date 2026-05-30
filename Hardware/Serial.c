@@ -1,6 +1,7 @@
 #include "stm32f4xx.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include "Serial.h"
 #include "DSHOT.h"
 #include "mavlink.h"
 #include "wit_c_sdk.h"
@@ -101,7 +102,7 @@ void Serial_Printf(char *format, ...)
     char String[100];
     va_list arg;
     va_start(arg, format);
-    vsprintf(String, format, arg);
+    vsnprintf(String, sizeof(String), format, arg);  // 防栈溢出
     va_end(arg);
     Serial_SendString(String);
 }
@@ -124,6 +125,126 @@ uint8_t Serial_GetRxData(void)
 void CopeCmdData(unsigned char ucData);
 void WitImu_CmdProcess(uint8_t ucData);
 void WitImu_DataIn(uint8_t ucData);
+
+// ========== 串口油门调试解析器 ==========
+// 协议帧格式: @xxx,xxx,xxx,xxx\r\n  (4个油门值，逗号分隔，范围0-4095)
+#define THROTTLE_PARSE_IDLE       0
+#define THROTTLE_PARSE_COLLECT    1
+#define THROTTLE_PARSE_BUF_MAX   32
+
+volatile uint8_t serial_throttle_updated = 0;  // 主循环检测并清零
+
+static uint8_t  throttle_parse_state = THROTTLE_PARSE_IDLE;
+static char     throttle_rx_buf[THROTTLE_PARSE_BUF_MAX];
+static uint8_t  throttle_rx_idx = 0;
+
+static void Serial_ParseThrottle(uint8_t byte)
+{
+    switch (throttle_parse_state)
+    {
+        case THROTTLE_PARSE_IDLE:
+            if (byte == '@')
+            {
+                throttle_parse_state = THROTTLE_PARSE_COLLECT;
+                throttle_rx_idx = 0;
+            }
+            break;
+
+        case THROTTLE_PARSE_COLLECT:
+            // 遇到换行符 → 结束帧
+            if (byte == '\n')
+            {
+                throttle_rx_buf[throttle_rx_idx] = '\0';
+                throttle_parse_state = THROTTLE_PARSE_IDLE;
+
+                // 解析 4 个逗号分隔值: t1,t2,t3,t4
+                if (throttle_rx_idx > 0)
+                {
+                    uint16_t vals[4] = {0, 0, 0, 0};
+                    uint8_t  seg = 0;
+                    uint16_t num = 0;
+                    uint8_t  has_digit = 0;
+
+                    for (uint8_t i = 0; i < throttle_rx_idx; i++)
+                    {
+                        char c = throttle_rx_buf[i];
+
+                        if (c == '\r')
+                            continue;       // 忽略回车
+
+                        if (c >= '0' && c <= '9')
+                        {
+                            num = num * 10 + (c - '0');
+                            has_digit = 1;
+                        }
+                        else if (c == ',')
+                        {
+                            if (seg < 4)
+                            {
+                                vals[seg] = num;
+                                seg++;
+                            }
+                            num = 0;
+                            has_digit = 0;
+                        }
+                        // 其他字符忽略（如回车 \r）
+                    }
+
+                    // 最后一个值（没有尾随逗号）
+                    if (has_digit && seg < 4)
+                    {
+                        vals[seg] = num;
+                        seg++;
+                    }
+
+                    // 必须收到恰好 4 个值
+                    if (seg == 4)
+                    {
+                        // 限幅 0-4095
+                        for (uint8_t k = 0; k < 4; k++)
+                        {
+                            if (vals[k] > 4095) vals[k] = 4095;
+                        }
+
+                        // 设置油门值（临界区保护）
+                        DSHOT_ENTER_CRITICAL();
+                        current_throttle[0] = vals[0];
+                        current_throttle[1] = vals[1];
+                        current_throttle[2] = vals[2];
+                        current_throttle[3] = vals[3];
+                        DSHOT_EXIT_CRITICAL();
+
+                        // 通知主循环更新DMA缓冲区
+                        serial_throttle_updated = 1;
+
+                        // 打印油门值、DSHOT帧及二进制到串口助手
+                        {
+                            uint16_t f0, f1, f2, f3;
+                            char b0[17], b1[17], b2[17], b3[17];
+                            f0 = (vals[0] << 4) | (((vals[0]>>8)&0x0F) + ((vals[0]>>4)&0x0F) + (vals[0]&0x0F)) & 0x0F;
+                            f1 = (vals[1] << 4) | (((vals[1]>>8)&0x0F) + ((vals[1]>>4)&0x0F) + (vals[1]&0x0F)) & 0x0F;
+                            f2 = (vals[2] << 4) | (((vals[2]>>8)&0x0F) + ((vals[2]>>4)&0x0F) + (vals[2]&0x0F)) & 0x0F;
+                            f3 = (vals[3] << 4) | (((vals[3]>>8)&0x0F) + ((vals[3]>>4)&0x0F) + (vals[3]&0x0F)) & 0x0F;
+                            fmt_bin16(f0, b0); fmt_bin16(f1, b1); fmt_bin16(f2, b2); fmt_bin16(f3, b3);
+                            Serial_Printf("[THR] SER: %d %d %d %d\r\n", vals[0], vals[1], vals[2], vals[3]);
+                            Serial_Printf("          BIN: %s %s %s %s\r\n", b0, b1, b2, b3);
+                        }
+                    }
+                }
+            }
+            // 缓冲区溢出 → 丢弃帧
+            else if (throttle_rx_idx >= THROTTLE_PARSE_BUF_MAX - 1)
+            {
+                throttle_parse_state = THROTTLE_PARSE_IDLE;
+            }
+            else
+            {
+                throttle_rx_buf[throttle_rx_idx++] = byte;
+            }
+            break;
+    }
+}
+
 void USART1_IRQHandler(void)
 {
     if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)
@@ -132,7 +253,7 @@ void USART1_IRQHandler(void)
         Serial_RxData = ucTemp;
         Serial_RxFlag = 1;
         WitImu_CmdProcess(ucTemp);
-        // 无需手动清除 RXNE 标志，读取 USART_ReceiveData 已自动清除
+        Serial_ParseThrottle(ucTemp);  // 并联油门调试解析，不干扰IMU
     }
 }
 
@@ -161,6 +282,13 @@ static struct {
 static volatile uint8_t uart2_tx_queue_head = 0;
 static volatile uint8_t uart2_tx_queue_tail = 0;
 static volatile uint8_t uart2_tx_queue_count = 0;
+
+// ========== 队列临界区保护（防止多ISR竞态） ==========
+// USART2_IRQ(pri0) 可抢占 TIM7/DMA1_Stream6(pri2)、TIM6(pri4)
+// ，这些ISR都可能调用 USART2_DMA_Send，必须互斥
+static uint32_t uart2_tx_crit_primask;
+#define UART2_TX_ENTER_CRITICAL()  do { uart2_tx_crit_primask = __get_PRIMASK(); __disable_irq(); } while(0)
+#define UART2_TX_EXIT_CRITICAL()   do { if (!uart2_tx_crit_primask) __enable_irq(); } while(0)
 
 // 前向声明
 static void USART2_DMA_Send_Next(void);
@@ -214,8 +342,11 @@ void USART2_DMA_Init(void)
   */
 void USART2_DMA_Send(uint8_t *data, uint16_t length)
 {
+    UART2_TX_ENTER_CRITICAL();
+    
     // 队列满，丢弃数据
     if(uart2_tx_queue_count >= UART2_TX_QUEUE_SIZE) {
+        UART2_TX_EXIT_CRITICAL();
         return;
     }
     
@@ -237,6 +368,8 @@ void USART2_DMA_Send(uint8_t *data, uint16_t length)
     if(!uart2_tx_busy) {
         USART2_DMA_Send_Next();
     }
+    
+    UART2_TX_EXIT_CRITICAL();
 }
 
 /**
@@ -289,8 +422,10 @@ void DMA1_Stream6_IRQHandler(void)
         // 失能USART2的DMA发送请求
         USART_DMACmd(USART2, USART_DMAReq_Tx, DISABLE);
         
-        // 发送队列中的下一条消息
+        // 发送队列中的下一条消息（临界区保护，防止USART2 ISR抢占破坏队列）
+        UART2_TX_ENTER_CRITICAL();
         USART2_DMA_Send_Next();
+        UART2_TX_EXIT_CRITICAL();
     }
 }
 

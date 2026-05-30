@@ -48,8 +48,12 @@ void mavlink_send_battery_voltage(float voltage_V);
 // ========== IMU 数据发送函数 ==========
 void mavlink_send_imu_attitude(WitImuData_t *imu_data);    // 发送角度 (ATTITUDE)
 void mavlink_send_scaled_imu(WitImuData_t *imu_data);     // 发送加速度+角速度+磁力计 (HIGHRES_IMU)
+void mavlink_send_servo_output(void);                      // 发送舵机/电机输出 (SERVO_OUTPUT_RAW)
 // ========== 油门命令队列函数 ==========
 uint8_t throttle_cmd_available(void);
 uint8_t throttle_cmd_dequeue(uint8_t *channel, uint16_t *value);
+/* 非临界区版本: 调用者已在全局关中断状态下使用 */
+uint8_t throttle_cmd_available_unsafe(void);
+uint8_t throttle_cmd_dequeue_unsafe(uint8_t *channel, uint16_t *value);
 
 #endif // MAVLINK_H
