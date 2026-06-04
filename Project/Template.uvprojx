@@ -630,6 +630,16 @@
               <FileType>1</FileType>
               <FilePath>..\mavlink_c\mavlink.c</FilePath>
             </File>
+            <File>
+              <FileName>drone_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\drone_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>drone_control.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\drone_control.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

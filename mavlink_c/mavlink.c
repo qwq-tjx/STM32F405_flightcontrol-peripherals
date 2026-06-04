@@ -5,6 +5,7 @@
 #include "wit_c_sdk.h"
 #include "LED.h"
 #include "control.h"
+#include "drone_control.h"
 
 // ========== DSHOT 电机油门值（来自 DSHOT.c） ==========
 extern volatile uint16_t current_throttle[4];
@@ -12,6 +13,7 @@ extern volatile uint16_t current_throttle[4];
 // ========== 控制目标值 (MAVLink接收 → PID使用) ==========
 volatile float  target_angle[3] = {0.0f, 0.0f, 0.0f};
 volatile float  target_gyro[3]  = {0.0f, 0.0f, 0.0f};
+volatile float  target_throttle = 0.0f;
 volatile uint8_t control_mode   = CTRL_MODE_DISABLED;
 
 // 临界区保护宏（保存/恢复 PRIMASK，防嵌套误开中断）
@@ -324,10 +326,10 @@ void mavlink_send_servo_output(void)
     mavlink_send_message(&msg);
 }
 
-// ========== 主动发送 IMU 数据的主函数 (定时器中断中调用) ==========
-// 交错发送: 偶数轮发气压+高度, 奇数轮发ScaledIMU+姿态
-// 每组 ~70B, 115200下 6ms → 100Hz循环有充足余量, 每条消息有效50Hz
-void mavlink_send_imu_periodic(void)
+// ========== 周期性 IMU 发送主函数 (TIM7 ISR 中调用, 100Hz) ==========
+// imu_data: 由 TIM7 ISR 在调用前一次性读取，传入复用，避免重复读取 IMU
+// 交错发送: 偶数轮发气压+高度+四元数, 奇数轮发 ScaledIMU+姿态
+void mavlink_send_imu_periodic(WitImuData_t *imu_data)
 {
     static uint32_t last_attitude_time = 0;
     static uint32_t last_heartbeat_time = 0;
@@ -349,22 +351,19 @@ void mavlink_send_imu_periodic(void)
     }
 
     if (attitude_stream_enabled) {
-        WitImuData_t imu_data;
-        WitImu_GetData(&imu_data);
-
         uint32_t attitude_interval_ms = attitude_interval_us / 1000;
         if (current_time - last_attitude_time >= attitude_interval_ms) {
             last_attitude_time = current_time;
 
             if (msg_phase == 0) {
-               // mavlink_send_vfr_hud(&imu_data);        // HUD (航向+高度)
-                mavlink_send_imu_pressure(&imu_data);   // 气压
-                mavlink_send_imu_altitude(&imu_data);   // 高度
-				mavlink_send_imu_quaternion(&imu_data);
+               // mavlink_send_vfr_hud(imu_data);        // HUD (航向+高度)
+                mavlink_send_imu_pressure(imu_data);     // 气压
+                mavlink_send_imu_altitude(imu_data);     // 高度
+                mavlink_send_imu_quaternion(imu_data);   // 四元数
                 msg_phase = 1;
             } else {
-                mavlink_send_scaled_imu(&imu_data);
-                mavlink_send_imu_attitude(&imu_data);
+                mavlink_send_scaled_imu(imu_data);       // 加速度+角速度+磁力计
+                mavlink_send_imu_attitude(imu_data);     // 欧拉角+角速度
                 msg_phase = 0;
             }
         }
@@ -506,35 +505,143 @@ static void process_mavlink_message(mavlink_message_t *msg)
             break;
         }
         
-        // ========== 接收目标姿态/角速度 (DEBUG_FLOAT_ARRAY, msgid=350) ==========
+        // ========== 接收目标姿态/角速度/油门 (DEBUG_FLOAT_ARRAY, msgid=350) ==========
         case MAVLINK_MSG_ID_DEBUG_FLOAT_ARRAY:
         {
             mavlink_debug_float_array_t dbg;
             mavlink_msg_debug_float_array_decode(msg, &dbg);
             
-            // 始终进入姿态控制模式 (同时使用角度外环+角速度内环)
-            control_mode = CTRL_MODE_ATTITUDE;
-            
-            // 目标角度 (弧度, 限幅 ±3.15 ≈ ±180.5°)
-            for (uint8_t i = 0; i < 3; i++) {
-                float v = dbg.data[i];
-                if (v > 3.15f) v = 3.15f;
-                if (v < -3.15f) v = -3.15f;
-                target_angle[i] = v;
+            // 根据 name 字段分发消息类型
+            // name="ATTI" 或 "RATE" → 姿态/角速度控制
+            // name="THRO" → 目标油门 (N)
+            if (dbg.name[0] == 'T' && dbg.name[1] == 'H' && dbg.name[2] == 'R' && dbg.name[3] == 'O')
+            {
+                // 目标总推力 (N), data[0], 限幅 0~100 N (≈ 0~10 kg)
+                float v = dbg.data[0];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 100.0f) v = 100.0f;
+                target_throttle = v;
+                
+                //Serial_Printf("[THR] throttle:%.2f N (%.2f kg)\r\n", v, v * 0.1019716f);
             }
-            
-            // 目标角速度 (rad/s, 限幅 ±34.9 ≈ ±2000°/s)
-            for (uint8_t i = 0; i < 3; i++) {
-                float v = dbg.data[i + 3];
-                if (v > 34.9f) v = 34.9f;
-                if (v < -34.9f) v = -34.9f;
-                target_gyro[i] = v;
+            else if (dbg.name[0] == 'D' && dbg.name[1] == 'I' && dbg.name[2] == 'S' && dbg.name[3] == 'A')
+            {
+                // 禁用控制模式
+                control_mode = CTRL_MODE_DISABLED;
+                Serial_Printf("[CTRL] DISABLED\r\n");
             }
-            
-            // 打印目标值到串口助手
-            Serial_Printf("[TGT] ang(deg):%.1f %.1f %.1f gyr(deg/s):%.1f %.1f %.1f\r\n",
-                target_angle[0] * 57.29578f, target_angle[1] * 57.29578f, target_angle[2] * 57.29578f,
-                target_gyro[0]  * 57.29578f, target_gyro[1]  * 57.29578f, target_gyro[2]  * 57.29578f);
+            else if (dbg.name[0] == 'P' && dbg.name[1] == 'I' && dbg.name[2] == 'D' && dbg.name[3] == 'P')
+            {
+                // PID参数: data[0]=T, data[1-3]=pidx Kp/Ki/Kd,
+                //           data[4-6]=pidy Kp/Ki/Kd, data[7-9]=pidz Kp/Ki/Kd
+                drone_control_param_t *p = &gDroneControlAlgo.param;
+                p->T = dbg.data[0];
+                p->pidx.Kp = dbg.data[1];  p->pidx.Ki = dbg.data[2];  p->pidx.Kd = dbg.data[3];
+                p->pidy.Kp = dbg.data[4];  p->pidy.Ki = dbg.data[5];  p->pidy.Kd = dbg.data[6];
+                p->pidz.Kp = dbg.data[7];  p->pidz.Ki = dbg.data[8];  p->pidz.Kd = dbg.data[9];
+                
+                // 自动按 Ki 比例设定积分限幅 (推荐 ratio=0.00075, 即 Ki=200 → limit=0.15)
+                const float ilim_ratio = 0.00075f;
+                p->pidx.integrate_limit = dbg.data[2] * ilim_ratio;
+                p->pidy.integrate_limit = dbg.data[5] * ilim_ratio;
+                p->pidz.integrate_limit = dbg.data[8] * ilim_ratio;
+                
+                Serial_Printf("[PID] T=%.2f | Roll:%.1f/%.1f/%.1f Pitch:%.1f/%.1f/%.1f Yaw:%.1f/%.1f/%.1f\r\n",
+                    (double)dbg.data[0],
+                    (double)dbg.data[1], (double)dbg.data[2], (double)dbg.data[3],
+                    (double)dbg.data[4], (double)dbg.data[5], (double)dbg.data[6],
+                    (double)dbg.data[7], (double)dbg.data[8], (double)dbg.data[9]);
+            }
+            else if (dbg.name[0] == 'P' && dbg.name[1] == 'I' && dbg.name[2] == 'D' && dbg.name[3] == 'Q')
+            {
+                // PID查询: 回读当前 PID 参数, 用 NAMED_VALUE_FLOAT(msgid=251) 逐个发送
+                drone_control_param_t *p = &gDroneControlAlgo.param;
+                float resp[10];
+                resp[0] = p->T;
+                resp[1] = p->pidx.Kp;  resp[2] = p->pidx.Ki;  resp[3] = p->pidx.Kd;
+                resp[4] = p->pidy.Kp;  resp[5] = p->pidy.Ki;  resp[6] = p->pidy.Kd;
+                resp[7] = p->pidz.Kp;  resp[8] = p->pidz.Ki;  resp[9] = p->pidz.Kd;
+
+                // 用 NAMED_VALUE_FLOAT 逐条发送 (MP 能识别 msgid=251)
+                const char *names[10] = {
+                    "PIDR0","PIDR1","PIDR2","PIDR3","PIDR4",
+                    "PIDR5","PIDR6","PIDR7","PIDR8","PIDR9"
+                };
+                uint32_t tms = delay_ms_count_get();
+                Serial_Printf("[PID] SENDING 10x NAMED_VALUE_FLOAT...\r\n");
+                for (int i = 0; i < 10; i++) {
+                    mavlink_message_t ack;
+                    mavlink_msg_named_value_float_pack(
+                        mavlink_system.sysid, mavlink_system.compid,
+                        &ack, tms, names[i], resp[i]);
+                    mavlink_send_message(&ack);
+                    Serial_Printf("[PID] NVF #%d: %s=%.2f\r\n", i, names[i], (double)resp[i]);
+                    Delay_ms(3);  // 防止 DMA 连续发送冲突
+                }
+                Serial_Printf("[PID] NVF DONE (10 sent)\r\n");
+
+                // 额外发 STATUSTEXT 双通道 (msgid=253, MP 100%转发)
+                // 单条50字节不够，拆成 PIDRA(5值) + PIDRB(5值)
+                char stBuf[50];
+                
+                // Part A: T + Roll Kp/Ki/Kd + Pitch Kp
+                snprintf(stBuf, sizeof(stBuf),
+                    "PIDRA|%g|%g|%g|%g|%g",
+                    (double)p->T,
+                    (double)p->pidx.Kp, (double)p->pidx.Ki, (double)p->pidx.Kd,
+                    (double)p->pidy.Kp);
+                mavlink_message_t stAMsg;
+                mavlink_msg_statustext_pack(
+                    mavlink_system.sysid, mavlink_system.compid,
+                    &stAMsg, MAV_SEVERITY_DEBUG, stBuf);
+                mavlink_send_message(&stAMsg);
+                Serial_Printf("[PID] STA: %s\r\n", stBuf);
+                Delay_ms(2);
+
+                // Part B: Pitch Ki/Kd + Yaw Kp/Ki/Kd
+                snprintf(stBuf, sizeof(stBuf),
+                    "PIDRB|%g|%g|%g|%g|%g",
+                    (double)p->pidy.Ki, (double)p->pidy.Kd,
+                    (double)p->pidz.Kp, (double)p->pidz.Ki, (double)p->pidz.Kd);
+                mavlink_message_t stBMsg;
+                mavlink_msg_statustext_pack(
+                    mavlink_system.sysid, mavlink_system.compid,
+                    &stBMsg, MAV_SEVERITY_DEBUG, stBuf);
+                mavlink_send_message(&stBMsg);
+                Serial_Printf("[PID] STB: %s\r\n", stBuf);
+
+                Serial_Printf("[PID] QUERY -> T=%.2f | Roll:%.1f/%.1f/%.1f Pitch:%.1f/%.1f/%.1f Yaw:%.1f/%.1f/%.1f\r\n",
+                    (double)p->T,
+                    (double)p->pidx.Kp, (double)p->pidx.Ki, (double)p->pidx.Kd,
+                    (double)p->pidy.Kp, (double)p->pidy.Ki, (double)p->pidy.Kd,
+                    (double)p->pidz.Kp, (double)p->pidz.Ki, (double)p->pidz.Kd);
+            }
+            else
+            {
+                // 姿态/角速度控制 (name="ATTI" 或 "RATE", 默认)
+                control_mode = CTRL_MODE_ATTITUDE;
+                
+                // 目标角度 (弧度, 限幅 ±3.15 ≈ ±180.5°)
+                for (uint8_t i = 0; i < 3; i++) {
+                    float v = dbg.data[i];
+                    if (v > 3.15f) v = 3.15f;
+                    if (v < -3.15f) v = -3.15f;
+                    target_angle[i] = v;
+                }
+                
+                // 目标角速度 (rad/s, 限幅 ±34.9 ≈ ±2000°/s)
+                for (uint8_t i = 0; i < 3; i++) {
+                    float v = dbg.data[i + 3];
+                    if (v > 34.9f) v = 34.9f;
+                    if (v < -34.9f) v = -34.9f;
+                    target_gyro[i] = v;
+                }
+                
+                // 打印目标值到串口助手
+                Serial_Printf("[TGT] ang(deg):%.1f %.1f %.1f gyr(deg/s):%.1f %.1f %.1f\r\n",
+                    target_angle[0] * 57.29578f, target_angle[1] * 57.29578f, target_angle[2] * 57.29578f,
+                    target_gyro[0]  * 57.29578f, target_gyro[1]  * 57.29578f, target_gyro[2]  * 57.29578f);
+            }
             
             break;
         }

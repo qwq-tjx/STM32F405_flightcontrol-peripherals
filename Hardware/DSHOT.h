@@ -46,7 +46,8 @@ uint8_t DShot_UpdateSingleChannel(uint8_t channel, uint16_t throttle);
 void DShot_RestartDMAChannel(uint8_t channel);
 
 extern volatile uint16_t current_throttle[4];
-extern volatile uint8_t  serial_throttle_updated;  // 串口调试标志：1=有新油门值待更新到DMA
+extern volatile uint8_t  serial_throttle_updated;   // 串口调试标志：1=有新油门值待更新到DMA
+extern volatile uint8_t  drone_throttle_updated;     // 飞控输出标志：1=ISR 已更新 current_throttle，需主循环刷新 DMA
 
 // DMA缓冲区（用于测试或调试）
 extern uint32_t dshot_dma_buffer_ch1[18];

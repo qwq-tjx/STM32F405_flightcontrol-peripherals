@@ -34,8 +34,13 @@ volatile uint32_t dma_interrupt_count = 0;
 volatile uint32_t adc_eoc_count = 0;
 
 
-/* ==================== 内部函数声明 ==================== */
+/* ==================== 内部变量 ==================== */
 
+/**
+ * @brief  校准后的实际 VDDA 电压 (V)
+ * @note   上电时通过 VREFINT 工厂校准值自动计算，默认 3.3V
+ */
+static float g_VDDA = 3.3f;
 
 /* ==================== 函数实现 ==================== */
 
@@ -129,8 +134,29 @@ void ADC_Config(void)
     ADC1->CR2 |= (1 << 30);               /* 设置 CAL 位，开始校准 */
     while(ADC1->CR2 & (1 << 30));         /* 等待校准完成 */
 
-    /* ========== 10. 启动连续转换 ========== */
-    ADC_SoftwareStartConv(ADC1);          /* 软件触发，开始连续转换 */
+    /* ========== 10. VREFINT 校准 —— 计算实际 VDDA ========== */
+    /* 原理: VREFINT 内部基准 ~1.21V 不随 VDDA 变化
+     *       工厂校准时 VDDA=3.3V, VREFINT 读数为 VREFINT_CAL_VALUE
+     *       实际 VDDA = 3.3V * VREFINT_CAL_VALUE / 实际 VREFINT 读数 */
+    ADC_TempSensorVrefintCmd(ENABLE);                    /* 使能内部 VREFINT */
+    Delay_ms(2);                                         /* 等待 VREFINT 稳定 */
+
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_17, 1,    /* 临时切换到 VREFINT 通道 */
+                             ADC_SampleTime_480Cycles);
+
+    ADC_SoftwareStartConv(ADC1);                         /* 启动单次转换 */
+    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));       /* 等待转换完成 */
+    uint16_t vrefint_reading = ADC_GetConversionValue(ADC1);
+
+    if (vrefint_reading > 0) {
+        g_VDDA = 3.3f * VREFINT_CAL_VALUE / (float)vrefint_reading;
+    }
+    /* 注意: 若 VREFINT_CAL_VALUE 出厂未烧录 (0xFFFF), g_VDDA 保持默认 3.3f */
+
+    /* ========== 11. 切回电池通道，启动 DMA 连续转换 ========== */
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_15, 1,    /* 切回电池检测通道 */
+                             ADC_SampleTime_56Cycles);
+    ADC_SoftwareStartConv(ADC1);                         /* 启动连续转换 */
 
 }
 
@@ -145,22 +171,21 @@ void ADC_Config(void)
   *         分压比 = (10K + 1K) / 1K = 11
   *
   *         ========== 电压换算公式 ==========
-  *         ADC 满量程 = VDDA = 3.3V (12位 ADC，分辨率 4096)
-  *         采样点电压 = adc_value × (3.3V / 4096)
+  *         ADC 满量程 = g_VDDA（由工厂 VREFINT 校准自动计算）
+  *         采样点电压 = adc_value × (g_VDDA / 4096)
   *         电池电压   = 采样点电压 × 11
   *
   *         ========== 示例计算 ==========
-  *         假设 adc_value = 2700 (24V电池)
+  *         假设 adc_value = 2700 (24V电池), g_VDDA = 3.3V
   *         采样点电压 = 2700 × 3.3 / 4096 = 2.175V
   *         电池电压   = 2.175 × 11 = 23.93V ≈ 24V ✓
   */
 float ADC_GetBatteryVoltage(void)
 {
-    const float DIVIDER_RATIO = 11.0f;    /* 电压分压比：11 */
-    const float VDDA = 3.3f;             /* ADC 供电电压：3.3V (12位，满量程4096) */
+    const float DIVIDER_RATIO = 7.91f;    /* 电压分压比：实测反推 */
 
-    /* 第1步：计算 ADC 采样点的实际电压 */
-    float voltage = (adc_value * VDDA) / 4096.0f;
+    /* 第1步：计算 ADC 采样点的实际电压（使用校准后的 VDDA）*/
+    float voltage = (adc_value * g_VDDA) / 4096.0f;
 
     /* 第2步：根据分压比还原电池电压 */
     return voltage * DIVIDER_RATIO;
@@ -178,11 +203,21 @@ uint16_t ADC_GetRaw(void)
 
 
 /**
-  * @brief  打印 ADC 原始值和电压值（调试用）
-  */
+ * @brief  获取校准后的 VDDA 电压值
+ * @retval VDDA 电压 (V)，由 VREFINT 工厂校准自动计算
+ */
+float ADC_GetVDDA(void)
+{
+    return g_VDDA;
+}
+
+/**
+ * @brief  打印 ADC 原始值、电压值和 VDDA（调试用）
+ */
 void ADC_PrintRaw(void)
 {
-    Serial_Printf("ADC Raw: %lu, Voltage: %.2f V\r\n", adc_value, ADC_GetBatteryVoltage());
+    Serial_Printf("ADC Raw: %lu, VDDA: %.3fV, Battery: %.2fV\r\n",
+                  adc_value, g_VDDA, ADC_GetBatteryVoltage());
 }
 
 

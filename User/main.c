@@ -9,10 +9,12 @@
 #include "TIM.h"
 #include "LED.h"
 #include "control.h"
+#include "drone_control.h"      /* 飞控算法库 */
 
+//控制循环放在 TIM7 ISR 中运行100hz
 //@brief  打印 ADC 原始值和电压值（调试用）
 //void ADC_PrintRaw(void)
-
+//mavlink524,TIM 287目标油门值串口调试
 //mavlink441~450，586.593油门值调试
 //mavlink534~537目标姿态角，角速度调试
 //serial 221,230
@@ -57,8 +59,12 @@ int main(void)
     ADC_Config();
     Serial_Printf("ADC_Config\r\n");
 
+    // 飞控算法初始化 (PID 全零，物理参数预设，上电仅此一次)
+    drone_control_algorithm_init();
+    Serial_Printf("DroneControl_Init\r\n");
+
     // 启动定时器
-    TIM7_Init(10000 - 1, 84 - 1);   // MAVLink 100Hz
+    TIM7_Init(10000 - 1, 84 - 1);   // 飞控 + MAVLink 100Hz
     TIM6_Init(10000 - 1, 8400 - 1); // 电池 1Hz
 
     // ========== 主循环 ==========
@@ -70,7 +76,7 @@ int main(void)
     {
         // 处理油门命令队列
         any_update = 0;
-
+		//ADC_PrintRaw();ADC电压检测
         DSHOT_ENTER_CRITICAL();
         while (throttle_cmd_available_unsafe()) {
             // 使用非临界区版本，避免嵌套 EXIT_CRITICAL 过早恢复中断
@@ -86,7 +92,13 @@ int main(void)
             any_update = 1;
         }
 
-        // 有更新时更新DMA缓冲区
+        // 飞控算法油门输出更新 (TIM7 ISR 在 control_mode != DISABLED 时写入)
+        if (drone_throttle_updated) {
+            drone_throttle_updated = 0;
+            any_update = 1;
+        }
+
+        // 有更新时刷新 DMA 缓冲区
         if (any_update) {
             DShot_UpdateAllChannels();
         }

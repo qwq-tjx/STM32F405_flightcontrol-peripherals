@@ -16,4 +16,6 @@ typedef enum {
 // data[3..5] → target_gyro[0..2]   (rad/s, ±34.9)
 extern volatile float  target_angle[3];   // roll, pitch, yaw
 extern volatile float  target_gyro[3];    // x, y, z
+extern volatile float  target_throttle;   // 目标总推力 (N)
 extern volatile uint8_t control_mode;
+

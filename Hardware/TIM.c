@@ -3,10 +3,17 @@
 #include "mavlink.h"
 #include "Serial.h"
 #include "wit_c_sdk.h"
-// 任务调度定时器初始化
-extern void mavlink_send_imu_periodic(void);
+#include "drone_control.h"      /* gDroneControlAlgo, IMU_Data_update, 控制算法 */
+#include "control.h"            /* target_angle, target_gyro, control_mode */
+#include "DSHOT.h"              /* current_throttle, DShot_SetAllThrottles, drone_throttle_updated */
+
+/* ==================== 外部函数声明 ==================== */
 extern float ADC_GetBatteryVoltage(void);
 extern void mavlink_send_battery_voltage(float voltage);
+
+/* ==================== 油门输出标志: ISR → 主循环 ==================== */
+// 由 TIM7 ISR 置 1，主循环消费后清零，触发 DShot_UpdateAllChannels()
+volatile uint8_t drone_throttle_updated = 0;
 
 /**
   * @brief  DMA 配置函数（支持优先级参数）
@@ -251,13 +258,70 @@ void TIM6_DAC_IRQHandler(void)
     }
 }
 
-// ==================== TIM7_IRQHandler 中断处理 (MAVLink发送 - 10ms周期) ====================
+// ==================== TIM7_IRQHandler 中断处理 (飞控 + MAVLink - 10ms周期 / 100Hz) ====================
+// 执行顺序: IMU读取 → 数据同步 → 外环(20Hz) → 内环(100Hz) → 油门输出 → MAVLink发送
 void TIM7_IRQHandler(void)
 {
     if(TIM_GetITStatus(TIM7, TIM_IT_Update) != RESET) {
         TIM_ClearITPendingBit(TIM7, TIM_IT_Update);
-        
-        // 周期性发送IMU数据
-        mavlink_send_imu_periodic();
+
+        /* 20Hz 外环分频计数器 (100Hz / 5 = 20Hz) */
+        static uint8_t outer_loop_counter = 0;
+
+        /* ========== 第1步: 读取 IMU 数据 (仅此一次，复用给控制和MAVLink) ========== */
+        WitImuData_t imu_data;
+        WitImu_GetData(&imu_data);
+
+        /* ========== 第2步: IMU → 飞控算法状态同步 (deg/g → rad/m/s²) ========== */
+        IMU_Data_update(&imu_data);
+
+        /* ========== 第3步: 飞控算法 (仅当 control_mode != DISABLED) ========== */
+        if (control_mode != CTRL_MODE_DISABLED) {
+
+            /* ---- 3a. 同步 MAVLink 目标姿态到算法 (target_angle 已是弧度) ---- */
+            gDroneControlAlgo.target_euler.roll  = target_angle[0];
+            gDroneControlAlgo.target_euler.pitch = target_angle[1];
+            gDroneControlAlgo.target_euler.yaw   = target_angle[2];
+            // 同步 MAVLink 目标油门到飞控算法
+            gDroneControlAlgo.target_throttle = target_throttle;
+            // [DEBUG] 每50次打印一次油门链路验证 (约0.5s间隔)
+            {
+                static uint16_t thr_dbg_cnt = 0;
+                if (++thr_dbg_cnt >= 50 && target_throttle > 0.01f) {
+                    thr_dbg_cnt = 0;
+                    Serial_Printf("[DEBUG] target_throttle=%.2fN -> algo=%.2fN\r\n",
+                                  (double)target_throttle, (double)gDroneControlAlgo.target_throttle);
+                }
+            }
+
+            /* ---- 3b. 角度外环: 每 5 次调用 1 次 (20Hz) ---- */
+            if (++outer_loop_counter >= 5) {
+                outer_loop_counter = 0;
+                drone_control_angle_outer_loop();
+            }
+
+            /* ---- 3c. 角速度内环: 每次调用 (100Hz) ---- */
+            drone_control_rate_inner_loop();
+
+            /* ---- 3d. 油门转换: rad/s → DSHOT (0~4095), 写入 current_throttle ---- */
+            uint16_t dshot_thr[4];
+            for (int i = 0; i < 4; i++) {
+                float rad_s = gDroneControlAlgo.motor_throttle[i];
+                if (rad_s < 0.0f) rad_s = 0.0f;                         /* 负转速截断 */
+                uint32_t val = (uint32_t)(rad_s * RAD_S_TO_DSHOT);      /* rad/s → DSHOT */
+                if (val > 4095) val = 4095;                             /* 上限饱和 */
+                dshot_thr[i] = (uint16_t)val;
+            }
+
+            /* 原子写入四个通道 (DShot_SetAllThrottles 内部关中断保护) */
+            DShot_SetAllThrottles(dshot_thr[0], dshot_thr[1], dshot_thr[2], dshot_thr[3]);
+
+            /* 通知主循环: 有新的控制输出需要更新 DMA */
+            drone_throttle_updated = 1;
+        }
+        /* control_mode == DISABLED 时跳过飞控，油门由主循环的队列/串口手动控制 */
+
+        /* ========== 第4步: 周期性 MAVLink 发送 (复用已读取的 IMU 数据) ========== */
+        mavlink_send_imu_periodic(&imu_data);
     }
 }

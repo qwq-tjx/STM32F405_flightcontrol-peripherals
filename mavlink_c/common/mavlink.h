@@ -49,6 +49,10 @@ void mavlink_send_battery_voltage(float voltage_V);
 void mavlink_send_imu_attitude(WitImuData_t *imu_data);    // 发送角度 (ATTITUDE)
 void mavlink_send_scaled_imu(WitImuData_t *imu_data);     // 发送加速度+角速度+磁力计 (HIGHRES_IMU)
 void mavlink_send_servo_output(void);                      // 发送舵机/电机输出 (SERVO_OUTPUT_RAW)
+
+// ========== 周期性 IMU 发送主函数 (定时器中断中调用, 100Hz) ==========
+// imu_data 由调用者（TIM7 ISR）传入，避免重复读取
+void mavlink_send_imu_periodic(WitImuData_t *imu_data);
 // ========== 油门命令队列函数 ==========
 uint8_t throttle_cmd_available(void);
 uint8_t throttle_cmd_dequeue(uint8_t *channel, uint16_t *value);

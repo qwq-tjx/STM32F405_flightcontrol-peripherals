@@ -1,6 +1,6 @@
 # FLYCONTROL STM32F405 飞控系统
 
-基于 STM32F405 的四轴飞行器飞控系统，支持 **MAVLink 通信**、**DSHOT15 数字电调**、**WitMotion IMU 姿态传感器**、**串口油门调试**、**Mission Planner 上位机插件 (油门控制 + IMU 3D可视化)**。
+基于 STM32F405 的四轴飞行器飞控系统，支持 **MAVLink 通信**、**DSHOT15 数字电调**、**WitMotion IMU 姿态传感器**、**双环 PID 姿态控制**、**串口油门调试**、**Mission Planner 上位机插件 (综合调参面板 + IMU 3D可视化)**。
 
 ---
 
@@ -80,9 +80,26 @@ DSHOT帧: 0011111110011011
 |-----------|-----|------|
 | MAV_CMD_DO_SET_SERVO | 183 | 设置单路/全部电机油门 |
 | RC_CHANNELS_OVERRIDE | 70 | RC 通道覆盖映射 |
-| DEBUG_FLOAT_ARRAY | 350 | 接收目标姿态角 (rad) + 目标角速度 (rad/s) |
+| DEBUG_FLOAT_ARRAY | 350 | 目标姿态/角速度 (name=ATTI) + PID参数 (name=PIDP) + PID查询 (name=PIDQ) |
 | MAV_CMD_SET_MESSAGE_INTERVAL | 511 | 设置消息发送频率 |
 | MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES | 520 | 返回飞控版本信息 |
+
+### PID 参数协议
+
+| 消息 | name | 数据 | 方向 |
+|------|------|------|------|
+| DEBUG_FLOAT_ARRAY | `PIDP` | data[0]=T, data[1-3]=Roll Kp/Ki/Kd, data[4-6]=Pitch, data[7-9]=Yaw | 上行 (发送PID) |
+| DEBUG_FLOAT_ARRAY | `PIDQ` | 空数据(10×0) | 上行 (查询PID) |
+| NAMED_VALUE_FLOAT | `PIDR0`~`PIDR9` | T + 3轴×3 = 10个值 | 下行 (飞控回传) |
+| STATUSTEXT | `PIDRA\|` / `PIDRB\|` | 双段各5值，组装为10个PID参数 | 下行 (备选回传通道) |
+
+### PID 默认值
+
+| 轴 | Kp | Ki | Kd | T |
+|----|-----|-----|-----|------|
+| Roll | 20 | 200 | 0 | 0.50s |
+| Pitch | 20 | 200 | 0 | |
+| Yaw | 25 | 250 | 0 | |
 
 ### 控制模式与目标值
 
@@ -101,6 +118,36 @@ DSHOT帧: 0011111110011011
 - `CTRL_MODE_DISABLED (0)` — 无控制，使用串口油门
 - `CTRL_MODE_ATTITUDE (1)` — 姿态控制 (外环角度+内环角速度)
 - `CTRL_MODE_RATE (2)` — 角速度控制 (仅内环)
+
+---
+
+## 控制算法
+
+飞控采用**双环串级 PID** 控制架构 (`User/drone_control.c`)：
+
+```
+                         目标姿态角 (20Hz)
+                              │
+                              ▼
+┌─────────────────────────────────────────────┐
+│  外环 (角度环): 角度误差 → PID → 目标角速度  │
+│     输入: target_angle[3] (Roll/Pitch/Yaw)  │
+│     输出: target_gyro[3] (期望角速度)        │
+└──────────────────┬──────────────────────────┘
+                   │
+                   ▼  当前角速度 (100Hz)
+┌─────────────────────────────────────────────┐
+│  内环 (角速度环): 角速度误差 → PID → 油门   │
+│     输入: target_gyro[3] + 当前角速度        │
+│     输出: motor_throttle[4] (0~4095)        │
+└─────────────────────────────────────────────┘
+```
+
+- **IMU 数据更新**: 100Hz (`TIM7_IRQHandler`)
+- **外环频率**: 20Hz (每5次执行1次)
+- **内环频率**: 100Hz (每次执行)
+- **PID 参数**: T(时间常数) + 三轴 Kp/Ki/Kd，可通过 MAVLink 在线调参
+- **控制输出**: `control_mode ≠ 0` 时覆写 `motor_throttle[4]`，否则使用串口油门
 
 ### 通道映射
 
@@ -156,22 +203,44 @@ DSHOT帧: 0011111110011011
 
 ## 上位机插件
 
-### ThrottleControlPlugin — 电机油门控制
+### ThrottleControlPlugin — 飞控综合调参面板
 
-Mission Planner 插件，提供可视化油门控制面板：
+Mission Planner 插件，一站式飞控调参工具：
 
-- 4 个独立 TrackBar + 数值输入框 (0~4095)
+**油门控制**
+- 4 路电机独立 TrackBar + 数值输入框 (0~4095)
+- 飞控油门回读显示 (SERVO_OUTPUT_RAW / RC_CHANNELS)
 - 同步所有电机 / 紧急停止按钮
 - 使用 `MAV_CMD_DO_SET_SERVO` (通道 9-12)
 
-### ImuVisualizationPlugin — IMU 3D可视化
+**目标姿态 / 角速度**
+- 三轴目标角度 (Roll/Pitch/Yaw, ±3.14 rad) 滑条 + 度数显示
+- 三轴目标角速度 (X/Y/Z, ±34.9 rad/s) 滑条
+- 通过 `DEBUG_FLOAT_ARRAY` (name=ATTI) 发送
 
-Mission Planner 插件，实时渲染飞控姿态：
+**PID 参数调谐**
+- 三轴 Kp/Ki/Kd (0.0~300.0) + 时间常数 T (0.00~1.00s)
+- 「发送 PID」按钮 → 手动推送到飞控 (滑条不自动发送)
+- 「查询 PID」按钮 → 从飞控回读当前 PID 值并同步控件
+- 「推荐值」按钮 → 恢复代码默认 PID (仅改 UI，不发送)
 
-- 3D 飞控模型实时旋转 (基于四元数)
-- 自动请求 IMU 数据流 (ATTITUDE/HIGHRES_IMU/ALTITUDE 等)
-- 航向角/高度/油门状态面板
-- 读取 `SERVO_OUTPUT_RAW` 显示电机油门状态
+**电池电压显示**
+- 实时显示母线电压 (V)、单节电压 (6S, 保留2位小数)、剩余电量 (%)
+- 数据来源: `SYS_STATUS` (msgid=1) 的 `voltage_battery` + `battery_remaining`
+- 单节 < 3.65V → 醒目红色低电压预警
+- 超时 5 秒无数据 → 灰色提示
+
+### TargetThrottlePlugin — 目标油门控件
+
+独立目标油门输入窗口，范围为 0~10 kg。
+
+### ImuVisualizationPlugin — IMU 数据可视化
+
+Mission Planner 插件，实时显示飞控传感器数据：
+- 欧拉角 / 角速度 / 加速度数值面板
+- 四元数 / 磁力计 / 气压高度面板
+- 姿态 / IMU / 高度 时间序列曲线图
+- 暂停刷新开关
 
 ### 直接控制 (无插件)
 
@@ -232,11 +301,12 @@ Waiting for RC commands...
 ├── Project/             Keil 工程文件
 ├── Startup/             startup_stm32f405xx.s
 ├── User/                用户应用
-│   ├── main.c           主程序
-│   ├── main.h
-│   └── control.h        控制模式 & 目标值声明
-├── ThrottleControlPlugin.cs   Mission Planner 油门控制插件
-└── ImuVisualizationPlugin.cs   Mission Planner IMU 3D可视化插件
+│   ├── main.c / main.h   主程序
+│   ├── control.c / control.h  控制模式 & 目标值
+│   ├── drone_control.c / drone_control.h  双环 PID 姿态控制算法
+├── ThrottleControlPlugin.cs   Mission Planner 综合调参插件
+├── TargetThrottlePlugin/      目标油门独立插件
+└── ImuVisualizationPlugin.cs   Mission Planner IMU 可视化插件
 ```
 
 ---
