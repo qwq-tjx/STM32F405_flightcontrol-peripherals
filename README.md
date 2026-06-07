@@ -60,19 +60,21 @@ DSHOT帧: 0011111110011011
 
 ### 上行 (发送)
 
-| 消息 | 频率 | 说明 |
-|------|------|------|
-| HEARTBEAT | 1Hz | 心跳包 |
-| ATTITUDE | ~50Hz | 姿态数据 (Roll/Pitch/Yaw) |
-| ATTITUDE_QUATERNION | ~50Hz | 四元数姿态 |
-| HIGHRES_IMU | ~50Hz | 加速度/角速度/磁力计 |
-| SCALED_PRESSURE | ~50Hz | 气压数据 |
-| ALTITUDE | ~50Hz | 高度数据 |
-| SERVO_OUTPUT_RAW | 2Hz | 4路电机油门回读 |
-| SYS_STATUS | 1Hz | 电池电压 |
+TIM7 ISR 100Hz 中调用 `mavlink_send_imu_periodic()`，默认 `attitude_interval_us=100000` (100ms=10Hz)，
+相位交替发送：
 
-> 消息交错发送 (偶数轮发气压+高度+四元数, 奇数轮发IMU+姿态), 每组约70B,
-> 115200下 6ms → 100Hz 循环有充足余量。
+| 周期 | 消息 | 单条频率 | 说明 |
+|------|------|:--:|------|
+| 1s | HEARTBEAT | 1Hz | 心跳包 |
+| 500ms | SERVO_OUTPUT_RAW | 2Hz | 4路电机油门回读 |
+| 10Hz 偶数轮 | SCALED_PRESSURE | 5Hz | 气压数据 |
+| 10Hz 偶数轮 | ALTITUDE | 5Hz | 高度数据 |
+| 10Hz 偶数轮 | ATTITUDE_QUATERNION | 5Hz | 四元数姿态 |
+| 10Hz 奇数轮 | HIGHRES_IMU | 5Hz | 加速度/角速度/磁力计 |
+| 10Hz 奇数轮 | ATTITUDE | 5Hz | 欧拉角+角速度 (Roll/Pitch/Yaw) |
+| 1s (TIM6) | SYS_STATUS | 1Hz | 电池电压 |
+
+> VFR_HUD 已注释禁用。姿态数据可通过 `MAV_CMD_SET_MESSAGE_INTERVAL` 动态调速。
 
 ### 下行 (接收命令)
 
