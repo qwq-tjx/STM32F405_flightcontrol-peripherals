@@ -93,7 +93,11 @@ DSHOT帧: 0011111110011011
 | NAMED_VALUE_FLOAT | `PIDR0`~`PIDR9` | T + 3轴×3 = 10个值 | 下行 (飞控回传) |
 | STATUSTEXT | `PIDRA\|` / `PIDRB\|` | 双段各5值，组装为10个PID参数 | 下行 (备选回传通道) |
 
-### PID 默认值
+### PID 初始化与推荐起始值
+
+PID 参数上电**初始化为全零**（电机不会自启动，需上位机写入后才会生效）。
+
+以下是代码注释中给出的**推荐调参起始值**（非默认值，需通过上位机手动写入）：
 
 | 轴 | Kp | Ki | Kd | T |
 |----|-----|-----|-----|------|
@@ -101,23 +105,114 @@ DSHOT帧: 0011111110011011
 | Pitch | 20 | 200 | 0 | |
 | Yaw | 25 | 250 | 0 | |
 
-### 控制模式与目标值
+### 控制模式
 
-接收 `DEBUG_FLOAT_ARRAY` 时自动进入姿态控制模式：
+飞控支持三种控制模式，由 `control_mode` 变量控制（定义于 `User/control.h`），在 `TIM7_IRQHandler` (100Hz) 中调度执行。
 
-| 数据索引 | 对应变量 | 含义 | 限幅范围 |
-|----------|----------|------|----------|
-| data[0] | target_angle[0] | Roll 目标角 (rad) | ±3.15 (±180.5°) |
-| data[1] | target_angle[1] | Pitch 目标角 (rad) | ±3.15 (±180.5°) |
-| data[2] | target_angle[2] | Yaw 目标角 (rad) | ±3.15 (±180.5°) |
-| data[3] | target_gyro[0] | X 轴目标角速度 (rad/s) | ±34.9 (±2000°/s) |
-| data[4] | target_gyro[1] | Y 轴目标角速度 (rad/s) | ±34.9 (±2000°/s) |
-| data[5] | target_gyro[2] | Z 轴目标角速度 (rad/s) | ±34.9 (±2000°/s) |
+#### 模式概览
 
-控制模式枚举 (`control.h`)：
-- `CTRL_MODE_DISABLED (0)` — 无控制，使用串口油门
-- `CTRL_MODE_ATTITUDE (1)` — 姿态控制 (外环角度+内环角速度)
-- `CTRL_MODE_RATE (2)` — 角速度控制 (仅内环)
+```
+DISABLED                    ATTI                          RATE
+════════                    ════                          ════
+IMU读取 ✓                   IMU读取 ✓                      IMU读取 ✓
+数据同步 ✓                  数据同步 ✓                     数据同步 ✓
+                            target_euler ← 插件            (不写 target_euler)
+                            outer loop 20Hz:               outer loop: 跳过 ✗
+                              q_e → error_angle            omega_ref ← 插件直接注入
+                              omega_ref = f(error_angle)   ─────────────↓
+                            ──────────────────────────→   内环 100Hz:
+飞控跳过 ✗                  内环 100Hz:                      PID(omega_ref vs gyro)
+                              PID(omega_ref vs gyro)        动力学补偿
+                              动力学补偿                     混控 → DSHOT
+                              混控 → DSHOT
+                            
+油门来源: 串口手动            油门来源: 插件 target_throttle   油门来源: 插件 target_throttle
+角度控制: 无                 角度控制: 自动回平              角度控制: 无 (松杆不停)
+```
+
+#### CTRL_MODE_DISABLED (0) — 应急/调试模式
+
+TIM7 中断中整个飞控模块被跳过：
+
+```
+if (control_mode != CTRL_MODE_DISABLED) {
+    // 外环 + 内环 + 混控 → 都不执行
+}
+// DISABLED 时油门由主循环的串口/DSHOT 队列手动控制
+```
+
+- 上电默认状态（安全，不会自动启动电机）
+- 串口命令 `@motor0,motor1,motor2,motor3\r\n` 手动调速
+- 上位机发 `name="DISA"` 可紧急切回
+
+#### CTRL_MODE_ATTITUDE (1) — 姿态自稳模式 (双环)
+
+完整的外环+内环控制链路：
+
+```
+目标角度 (target_angle[3])
+    │
+    ▼  外环 20Hz
+euler_to_quaternion(target_euler) → q_d
+q_e = q_c⁻¹ * q_d                      ← 误差四元数
+提取轴角: error_angle, error_axis
+omega_ref = (error_angle / T) * error_axis   ← T 为收敛时间常数
+    │
+    ▼  内环 100Hz
+PID(omega_ref vs angular_velocity) → alpha_ref
+tau = J·alpha + ω×(J·ω)               ← 欧拉动力学
+混控分配: thrust + torque → 四电机转速
+    │
+    ▼
+转速 → DSHOT (0~4095) → DMA 输出
+```
+
+- 指定目标 Roll/Pitch/Yaw → 飞控自动解算角速度 → 达到期望姿态
+- 松杆 → 回平 (目标角度=0)
+- 通过 `DEBUG_FLOAT_ARRAY` (name=`ATTI`) 接收：data[0-2]=目标角度(rad), data[3-5]=目标角速度(rad/s)
+
+#### CTRL_MODE_RATE (2) — 角速度模式 (仅内环)
+
+跳过外环，插件直接下发目标角速度：
+
+```
+target_gyro[3] (由插件直接指定)
+    │
+    ▼ (跳过外环, omega_ref = target_gyro)
+内环 100Hz:
+  PID(omega_ref vs angular_velocity) → alpha_ref
+  tau = J·alpha + ω×(J·ω)
+  混控分配 → 四电机转速
+    │
+    ▼
+转速 → DSHOT (0~4095) → DMA 输出
+```
+
+- 仅内环运行，无外环角度闭环
+- 不自动回平，松杆后不会回到水平
+- 通过 `DEBUG_FLOAT_ARRAY` (name=`RATE`) 接收：data[0-2]=目标角速度(rad/s)
+
+#### 模式切换
+
+通过 `DEBUG_FLOAT_ARRAY` 消息的 `name` 字段切换：
+
+| name | 对应模式 | 说明 |
+|------|:---:|------|
+| `DISA` | DISABLED | 立即停止飞控，退回手动油门 |
+| `ATTI` | ATTITUDE | 双环姿态控制 |
+| `RATE` | RATE | 仅内环角速度控制 |
+
+#### 对比总结
+
+| | DISABLED | ATTI | RATE |
+|---|:---:|:---:|:---:|
+| 外环 (20Hz) | ❌ | ✅ 轴角误差法 | ❌ |
+| 内环 PID (100Hz) | ❌ | ✅ | ✅ |
+| 动力学补偿 | ❌ | ✅ | ✅ |
+| omega_ref 来源 | — | 外环计算 | 插件直接赋值 |
+| target_euler 写入 | ❌ | ✅ | ❌ |
+| 自动回平 | — | ✅ | ❌ |
+| DSHOT 输出 | 串口手动 | PID+混控 | PID+混控 |
 
 ---
 
@@ -162,20 +257,21 @@ DSHOT帧: 0011111110011011
 
 ```
 初始化流程:
-  systick → USART1(调试) → Debug_Init
-         → UART5 + WitMotion IMU
+  systick → USART1(调试) → UART5 + WitMotion IMU
          → USART2 + MAVLink
          → DSHOT(TIM8+DMA)
          → ADC 电池检测
-         → TIM7 (100Hz MAVLink 发送)
+         → 飞控算法初始化
+         → TIM7 (100Hz 飞控+MAVLink)
          → TIM6 (1Hz 电池电压)
 
 主循环:
   while(1):
-    1. 处理油门命令缓冲区
-    2. 检测串口油门更新标志
-    3. 更新 DSHOT DMA 缓冲区
-    4. 输出调试信息
+    1. 处理 MAVLink 油门命令队列
+    2. 检测串口油门更新标志 (USART1)
+    3. 检测飞控算法油门更新标志 (TIM7 ISR)
+    4. 任一更新 → 刷新 DSHOT DMA 缓冲区
+    5. LED 1Hz 闪烁 (与 MAVLink 心跳同步)
 ```
 
 ---
@@ -250,33 +346,75 @@ Mission Planner 插件，实时显示飞控传感器数据：
 
 ## 串口调试
 
-连接 PA9 (TX) / PA10 (RX)，波特率 115200。
+飞控板提供 3 个串口：USART1 (PA9/PA10) 为调试串口，USART2 (PA2/PA3) 为 MAVLink，UART5 (PC12/PD2) 为 IMU。
 
-### 串口油门控制
+### 一、USART1 串口油门直驱协议
 
-通过串口助手发送油门指令，帧格式如下：
-
-```
-@xxx,xxx,xxx,xxx\r\n
-```
-
-- 帧头 `@`，帧尾 `\r\n`
-- 4 个逗号分隔值，范围 0~4095（超过自动限幅）
-- 示例：`@1000,2000,500,0\r\n`
-
-### 启动信息示例
+通过串口助手（115200 8N1）发送油门指令，帧格式：
 
 ```
-========================================
-       FLYCONTROL STM32F405 System      
-========================================
-System Clock: 168 MHz
-DSHOT Mode: DSHOT15 (PC6-PC9)
-MAVLink: Ready (USART2)
-IMU: WitMotion (UART5)
-========================================
-Waiting for RC commands...
+@t1,t2,t3,t4\r\n
 ```
+
+| 字段 | 说明 |
+|------|------|
+| `@` | 帧头标记 |
+| `t1~t4` | 4 个电机油门值，逗号分隔，范围 0~4095 |
+| `\r\n` | 帧尾（`\r` 可省略，`\n` 必须） |
+
+**示例**：发送 `@1000,1000,800,800` + 回车
+
+飞控收到后回显确认：
+```
+[THR] SER: 1000 1000 800 800
+          BIN: 0000001111101000 0000001111101000 0000001100100000 0000001100100000
+```
+
+> **注意**：超范围值自动限幅到 4095；无需任何上位机软件，任意串口助手均可使用。
+> 实现位置：`Hardware/Serial.c` → `Serial_ParseThrottle()`
+
+### 二、ADC 电池电压调试打印
+
+函数 `ADC_PrintRaw()` (定义于 `Hardware/adc.c`)，输出 ADC 原始值、VDDA 参考电压和电池电压。
+
+**使用方法**：在 `main.c` 主循环中取消 `ADC_PrintRaw()` 的注释即可：
+```c
+// main.c 主循环中
+ADC_PrintRaw();  // 取消注释可打印电池电压/VDDA/ADC原始值到USART1
+```
+
+**输出示例**：
+```
+ADC Raw: 2048, VDDA: 3.296V, Battery: 22.13V
+```
+
+> **注意**：调用频率过高会阻塞 USART1，建议加延时或降频打印。
+
+### 三、启动信息
+
+上电后 USART1 串口助手会依次输出：
+```
+USART_Init
+DShot_Init
+ADC_Config
+DroneControl_Init
+```
+
+### 四、已禁用的串口阻塞打印 (P0 修复)
+
+由于 ISR 上下文中的阻塞 `Serial_Printf` 会抢占 UART5，导致 IMU 传感器丢包和飞控失控，
+以下打印已被注释禁用。如需调试，在**主循环或低优先级 ISR** 中取消注释即可，
+**绝对不要**在 `USART2_IRQ` 或 `UART5_IRQ` 中解注。
+
+| 文件 | 行号 | 原打印内容 | 用途 |
+|------|------|-----------|------|
+| `mavlink_c/mavlink.c` | 532 | `[THR] throttle:%.2f N` | MAVLink 目标油门 |
+| | 538 | `[CTRL] DISABLED` | 控制模式禁用通知 |
+| | 555-556 | `[RATE] gyr(deg/s):...` | 角速度模式目标值 |
+| | 580-582 | `[ATTI] ang(deg):...` | 姿态模式目标值 |
+| | 607-611 | `[PIDP] T=...` | PID 参数写入确认 |
+| | 666,674 | `[THR] SERVO ch%d=%d` | 舵机/电机设置确认 |
+| `Hardware/TIM.c` | 297-298 | `[DEBUG] target_throttle=...` | 油门链路验证 |
 
 ---
 
@@ -287,26 +425,26 @@ Waiting for RC commands...
 ├── Hardware/            硬件驱动模块
 │   ├── DSHOT.c/.h       DSHOT 电调驱动
 │   ├── Serial.c/.h      串口驱动 (USART1/2, UART5)
-│   ├── TIM.c/.h         定时器 + DMA 配置
+│   ├── TIM.c/.h         定时器 + 飞控控制调度
+│   ├── PWM.c/.h         PWM 基础驱动
 │   ├── adc.c/.h         ADC 电池检测
 │   ├── Delay.c/.h       SysTick 延时
-│   ├── debug_output.c/.h 调试输出
+│   ├── LED.c/.h         LED 指示
 │   ├── wit_c_sdk.c/.h   WitMotion IMU SDK
-│   ├── REG.h            IMU 寄存器映射
-│   └── imu_simulator.c/.h IMU 模拟器 (测试用)
+│   └── REG.h            IMU 寄存器映射
 ├── Library/             STM32F4xx 标准外设库
 ├── mavlink_c/           MAVLink v2 协议栈
 │   ├── mavlink.c        自定义 MAVLink 处理逻辑
-│   └── common/          所有 MAVLink 消息头文件
+│   └── common.h          所有 MAVLink 消息头文件
 ├── Project/             Keil 工程文件
 ├── Startup/             startup_stm32f405xx.s
 ├── User/                用户应用
 │   ├── main.c / main.h   主程序
 │   ├── control.c / control.h  控制模式 & 目标值
 │   ├── drone_control.c / drone_control.h  双环 PID 姿态控制算法
-├── ThrottleControlPlugin.cs   Mission Planner 综合调参插件
-├── TargetThrottlePlugin/      目标油门独立插件
-└── ImuVisualizationPlugin.cs   Mission Planner IMU 可视化插件
+├── ThrottleControlPlugin.dll   Mission Planner 综合调参插件
+├── TargetThrottlePlugin.dll    目标油门独立插件
+└── ImuVisualizationPlugin.dll  Mission Planner IMU 可视化插件
 ```
 
 ---

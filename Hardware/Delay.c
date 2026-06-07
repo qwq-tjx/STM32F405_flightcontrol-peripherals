@@ -84,6 +84,6 @@ void systick_init(void)
         while(1);
     }
     
-    // SysTick 优先级 = 1
-    NVIC_SetPriority(SysTick_IRQn, (0 << 2) | 1);
+    // SysTick 最低优先级, 避免抢占飞控 100Hz 主循环导致抖动
+    NVIC_SetPriority(SysTick_IRQn, (3 << 2) | 3);
 }

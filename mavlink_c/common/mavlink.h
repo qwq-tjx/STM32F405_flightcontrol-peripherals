@@ -60,4 +60,6 @@ uint8_t throttle_cmd_dequeue(uint8_t *channel, uint16_t *value);
 uint8_t throttle_cmd_available_unsafe(void);
 uint8_t throttle_cmd_dequeue_unsafe(uint8_t *channel, uint16_t *value);
 
+
+
 #endif // MAVLINK_H

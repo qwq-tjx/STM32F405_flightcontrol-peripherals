@@ -193,6 +193,14 @@ void drone_control_angle_outer_loop(void)
 {
     drone_control_param_t *param = &gDroneControlAlgo.param;
 
+    /* ---- 守卫: T 未配置或过小时跳过外环，避免 1/0 → NaN 导致电机失控 ---- */
+    if (param->T <= 1e-3f) {
+        gDroneControlAlgo.omega_ref.x = 0.0f;
+        gDroneControlAlgo.omega_ref.y = 0.0f;
+        gDroneControlAlgo.omega_ref.z = 0.0f;
+        return;
+    }
+
     // 当前姿态四元数直接从 IMU 实例读取，无需欧拉角转换
     quaternion_t q_c = gDroneControlAlgo.quaternion;
 
@@ -348,6 +356,9 @@ void IMU_Data_update(const WitImuData_t *imu)
     gDroneControlAlgo.euler.roll  = imu->angle[0] * DEG_TO_RAD;
     gDroneControlAlgo.euler.pitch = imu->angle[1] * DEG_TO_RAD;
     gDroneControlAlgo.euler.yaw   = imu->angle[2] * DEG_TO_RAD;
+    // 归一化 yaw 到 [-π, π]，与控件 target 范围对齐 (IMU 原始范围 [0°, 360°])
+    if (gDroneControlAlgo.euler.yaw > M_PI)
+        gDroneControlAlgo.euler.yaw -= 2.0f * M_PI;
 
     /* ---- 3. 角速度: deg/s → rad/s ---- */
     gDroneControlAlgo.angular_velocity.x = imu->gyro[0] * DEG_TO_RAD;

@@ -112,14 +112,14 @@ void ADC_Config(void)
     /* DMA 中断优先级配置 */
     NVIC_InitTypeDef NVIC_InitStruct;
     NVIC_InitStruct.NVIC_IRQChannel = DMA2_Stream0_IRQn;
-    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 2;   // 电池采样，低优先级
+    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 3;   // 电池采样，最低抢占优先级
     NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
     NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStruct);
     
     /* ADC EOC 中断优先级配置（调试用）*/
     NVIC_InitStruct.NVIC_IRQChannel = ADC_IRQn;
-    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 2;
+    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 3;
     NVIC_InitStruct.NVIC_IRQChannelSubPriority = 1;
     NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStruct);

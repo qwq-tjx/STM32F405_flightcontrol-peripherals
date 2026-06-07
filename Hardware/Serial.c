@@ -43,7 +43,7 @@ void USART1_Init(void)
     
     NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;  // 调试信息，次高优先级
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 3;  // 调试串口，最低抢占优先级
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
     NVIC_Init(&NVIC_InitStructure);
 }
@@ -275,6 +275,7 @@ static volatile uint8_t uart2_tx_busy = 0;
 
 // ========== 发送队列 ==========
 #define UART2_TX_QUEUE_SIZE  8
+static volatile uint32_t uart2_tx_queue_overflow = 0;          // 诊断：队列满丢弃计数
 static struct {
     uint8_t data[256];
     uint16_t length;
@@ -328,7 +329,7 @@ void USART2_DMA_Init(void)
     
     // 5. 配置NVIC中断优先级
     NVIC_InitStruct.NVIC_IRQChannel = DMA1_Stream6_IRQn;
-    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 2;  // 低于遥控信号优先级
+    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 3;  // USART2 DMA TX, 最低抢占优先级
     NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
     NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStruct);
@@ -344,8 +345,9 @@ void USART2_DMA_Send(uint8_t *data, uint16_t length)
 {
     UART2_TX_ENTER_CRITICAL();
     
-    // 队列满，丢弃数据
+    // 队列满，丢弃数据（记录溢出次数用于诊断）
     if(uart2_tx_queue_count >= UART2_TX_QUEUE_SIZE) {
+        uart2_tx_queue_overflow++;
         UART2_TX_EXIT_CRITICAL();
         return;
     }

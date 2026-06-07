@@ -94,16 +94,17 @@ void MYDMA_Config(DMA_Stream_TypeDef *DMA_Streamx, u32 chx, u32 par, u32 mar, u1
     else return;  // 不支持的 DMA 数据流，直接返回
     
     // 根据 DMA 优先级设置 NVIC 抢占优先级
-    // DShot: VeryHigh/High → 抢占优先级 0（最高）
-    // ADC:   Low/Medium   → 抢占优先级 1（较低）
+    // 注意: 调用方(如 DShot)会立即用 NVIC_Init 覆盖此值
+    // DShot: VeryHigh/High → 抢占优先级 1（高于飞控主循环）
+    // ADC:   Low/Medium   → 抢占优先级 3（低于飞控主循环）
     if(priority == DMA_Priority_VeryHigh || priority == DMA_Priority_High)
     {
-        NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 0;
+        NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 1;
         NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
     }
     else
     {
-        NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 1;
+        NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 3;
         NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
     }
     
@@ -206,8 +207,8 @@ void TIM6_Init(u32 arr, u32 psc)
 
     // 4. 配置NVIC
     NVIC_InitStruct.NVIC_IRQChannel = TIM6_DAC_IRQn;
-    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 4;  // 低优先级
-    NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
+    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 3;  // Group2下最低抢占优先级, 电池检测最低需求
+    NVIC_InitStruct.NVIC_IRQChannelSubPriority = 2;
     NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStruct);
 
@@ -278,26 +279,37 @@ void TIM7_IRQHandler(void)
         /* ========== 第3步: 飞控算法 (仅当 control_mode != DISABLED) ========== */
         if (control_mode != CTRL_MODE_DISABLED) {
 
-            /* ---- 3a. 同步 MAVLink 目标姿态到算法 (target_angle 已是弧度) ---- */
-            gDroneControlAlgo.target_euler.roll  = target_angle[0];
-            gDroneControlAlgo.target_euler.pitch = target_angle[1];
-            gDroneControlAlgo.target_euler.yaw   = target_angle[2];
-            // 同步 MAVLink 目标油门到飞控算法
-            gDroneControlAlgo.target_throttle = target_throttle;
-            // [DEBUG] 每50次打印一次油门链路验证 (约0.5s间隔)
-            {
-                static uint16_t thr_dbg_cnt = 0;
-                if (++thr_dbg_cnt >= 50 && target_throttle > 0.01f) {
-                    thr_dbg_cnt = 0;
-                    Serial_Printf("[DEBUG] target_throttle=%.2fN -> algo=%.2fN\r\n",
-                                  (double)target_throttle, (double)gDroneControlAlgo.target_throttle);
-                }
+            /* ---- 3a. 同步目标值到算法 ---- */
+            if (control_mode == CTRL_MODE_ATTITUDE) {
+                /* ATTI: 同步目标姿态角 */
+                gDroneControlAlgo.target_euler.roll  = target_angle[0];
+                gDroneControlAlgo.target_euler.pitch = target_angle[1];
+                gDroneControlAlgo.target_euler.yaw   = target_angle[2];
             }
+            /* 同步 MAVLink 目标油门到飞控算法 (所有非 DISABLED 模式共享) */
+            gDroneControlAlgo.target_throttle = target_throttle;
+            /* P0修复: 移除 TIM7 ISR 内阻塞打印, 每周期~4.3ms 占 43% 周期 */
+            // [DEBUG] 每50次打印一次油门链路验证 (约0.5s间隔) — 已禁用
+            // {
+            //     static uint16_t thr_dbg_cnt = 0;
+            //     if (++thr_dbg_cnt >= 50 && target_throttle > 0.01f) {
+            //         thr_dbg_cnt = 0;
+            //         Serial_Printf("[DEBUG] target_throttle=%.2fN -> algo=%.2fN\r\n",
+            //                       (double)target_throttle, (double)gDroneControlAlgo.target_throttle);
+            //     }
+            // }
 
-            /* ---- 3b. 角度外环: 每 5 次调用 1 次 (20Hz) ---- */
-            if (++outer_loop_counter >= 5) {
-                outer_loop_counter = 0;
-                drone_control_angle_outer_loop();
+            if (control_mode == CTRL_MODE_RATE) {
+                /* RATE 模式: 跳过外环, omega_ref 直接由 target_gyro 提供 */
+                gDroneControlAlgo.omega_ref.x = target_gyro[0];
+                gDroneControlAlgo.omega_ref.y = target_gyro[1];
+                gDroneControlAlgo.omega_ref.z = target_gyro[2];
+            } else {
+                /* ATTI 模式: 角度外环, 每 5 次调用 1 次 (20Hz) */
+                if (++outer_loop_counter >= 5) {
+                    outer_loop_counter = 0;
+                    drone_control_angle_outer_loop();
+                }
             }
 
             /* ---- 3c. 角速度内环: 每次调用 (100Hz) ---- */
