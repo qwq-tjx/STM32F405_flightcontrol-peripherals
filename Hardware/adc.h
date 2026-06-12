@@ -30,7 +30,7 @@
 /**
   * @brief  ADC 采样值（由 DMA 自动更新）
   */
-extern volatile uint32_t adc_value;
+extern volatile uint16_t adc_value;
 
 /**
   * @brief  新数据标志位

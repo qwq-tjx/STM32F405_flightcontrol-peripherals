@@ -5,6 +5,7 @@
 #include "DSHOT.h"
 #include "mavlink.h"
 #include "wit_c_sdk.h"
+#include "mtf01.h"          /* micolink_decode() */
 
 //******************USART1*******************
 static uint8_t Serial_RxData;
@@ -571,4 +572,63 @@ void UART5_SendData(uint8_t *p_data, uint32_t uiSize)
     }
     
     while(USART_GetFlagStatus(UART5, USART_FLAG_TC) == RESET);
+}
+
+//******************UART3 MTF-01 光流传感器*******************
+// 引脚: PB10 (TX), PB11 (RX), 115200-8N1
+// MicoAir Micolink 协议, RXNE 中断逐字节 micolink_decode()
+
+volatile optflow_raw_t g_optflow = {0, 0, 0, 0, 0};
+
+void UART3_Init(void)
+{
+    GPIO_InitTypeDef  GPIO_InitStruct;
+    USART_InitTypeDef USART_InitStruct;
+    NVIC_InitTypeDef  NVIC_InitStruct;
+
+    /* ---- 1. 时钟使能 ---- */
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);
+
+    /* ---- 2. GPIO 复用配置 ---- */
+    GPIO_PinAFConfig(GPIOB, GPIO_PinSource10, GPIO_AF_USART3);
+    GPIO_PinAFConfig(GPIOB, GPIO_PinSource11, GPIO_AF_USART3);
+
+    GPIO_InitStruct.GPIO_Pin   = GPIO_Pin_10 | GPIO_Pin_11;
+    GPIO_InitStruct.GPIO_Mode  = GPIO_Mode_AF;
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStruct.GPIO_OType = GPIO_OType_PP;
+    GPIO_InitStruct.GPIO_PuPd  = GPIO_PuPd_UP;
+    GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* ---- 3. USART 基本配置 ---- */
+    USART_InitStruct.USART_BaudRate            = 115200;
+    USART_InitStruct.USART_WordLength          = USART_WordLength_8b;
+    USART_InitStruct.USART_StopBits            = USART_StopBits_1;
+    USART_InitStruct.USART_Parity              = USART_Parity_No;
+    USART_InitStruct.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_InitStruct.USART_Mode                = USART_Mode_Rx | USART_Mode_Tx;
+    USART_Init(USART3, &USART_InitStruct);
+
+    /* ---- 4. RXNE 中断 ---- */
+    USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+
+    /* ---- 5. NVIC ---- */
+    NVIC_InitStruct.NVIC_IRQChannel                   = USART3_IRQn;
+    NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 1;   /* 低于 IMU(0), 高于飞控(2) */
+    NVIC_InitStruct.NVIC_IRQChannelSubPriority        = 0;
+    NVIC_InitStruct.NVIC_IRQChannelCmd                = ENABLE;
+    NVIC_Init(&NVIC_InitStruct);
+
+    /* ---- 6. 使能 ---- */
+    USART_Cmd(USART3, ENABLE);
+}
+
+void USART3_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART3, USART_IT_RXNE) != RESET)
+    {
+        uint8_t byte = USART_ReceiveData(USART3);   /* 读取自动清除 RXNE */
+        micolink_decode(byte);
+    }
 }

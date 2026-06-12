@@ -260,14 +260,16 @@ void TIM6_DAC_IRQHandler(void)
 }
 
 // ==================== TIM7_IRQHandler 中断处理 (飞控 + MAVLink - 10ms周期 / 100Hz) ====================
-// 执行顺序: IMU读取 → 数据同步 → 外环(20Hz) → 内环(100Hz) → 油门输出 → MAVLink发送
+// 执行顺序: IMU读取 → 光流更新 → 数据同步 → VH外环(10Hz) → 角度外环(20Hz) → 内环(100Hz) → 油门输出 → MAVLink发送
 void TIM7_IRQHandler(void)
 {
     if(TIM_GetITStatus(TIM7, TIM_IT_Update) != RESET) {
         TIM_ClearITPendingBit(TIM7, TIM_IT_Update);
 
-        /* 20Hz 外环分频计数器 (100Hz / 5 = 20Hz) */
+        /* 20Hz 角度外环分频计数器 (100Hz / 5 = 20Hz) */
         static uint8_t outer_loop_counter = 0;
+        /* 10Hz 速度/高度外环分频计数器 (100Hz / 10 = 10Hz) */
+        static uint8_t vh_counter = 0;
 
         /* ========== 第1步: 读取 IMU 数据 (仅此一次，复用给控制和MAVLink) ========== */
         WitImuData_t imu_data;
@@ -276,46 +278,68 @@ void TIM7_IRQHandler(void)
         /* ========== 第2步: IMU → 飞控算法状态同步 (deg/g → rad/m/s²) ========== */
         IMU_Data_update(&imu_data);
 
-        /* ========== 第3步: 飞控算法 (仅当 control_mode != DISABLED) ========== */
+        /* ========== 第3步: 光流数据同步 (100Hz, 有新鲜数据时更新) ========== */
+        if (g_optflow.fresh) {
+            Optflow_Data_update(
+                (float)g_optflow.flow_vel_x,      /* cm/s → m/s 内部转换 */
+                (float)g_optflow.flow_vel_y,
+                (float)g_optflow.distance,         /* mm → m 内部转换 */
+                g_optflow.flow_quality
+            );
+            g_optflow.fresh = 0;
+        }
+
+        /* ========== 第4步: 飞控算法 (仅当 control_mode != DISABLED) ========== */
         if (control_mode != CTRL_MODE_DISABLED) {
 
-            /* ---- 3a. 同步目标值到算法 ---- */
+            /* ---- 4a. VH 模式专属: 速度+高度外环 (10Hz) ---- */
+            if (control_mode == CTRL_MODE_VH) {
+                /* 同步目标速度 & 高度 (每次 100Hz, 确保最新值) */
+                gDroneControlAlgo.target_velocity.x = target_velocity[0];
+                gDroneControlAlgo.target_velocity.y = target_velocity[1];
+                gDroneControlAlgo.target_velocity.z = target_velocity[2];
+                gDroneControlAlgo.target_altitude    = target_altitude;
+
+                /* VH 模式下 yaw 独立控制，直接从地面站同步 */
+                gDroneControlAlgo.target_euler.yaw = target_angle[2];
+
+                /* 10Hz: 速度+高度外环 → 输出 target_euler.roll/pitch + target_throttle */
+                if (++vh_counter >= 10) {
+                    vh_counter = 0;
+                    drone_control_velocity_altitude_control();
+                }
+            }
+
+            /* ---- 4b. 同步目标值到算法 (ATTI / RATE 模式) ---- */
             if (control_mode == CTRL_MODE_ATTITUDE) {
-                /* ATTI: 同步目标姿态角 */
+                /* ATTI: 同步目标姿态角 (VH 模式不走此分支, 姿态由速度环计算) */
                 gDroneControlAlgo.target_euler.roll  = target_angle[0];
                 gDroneControlAlgo.target_euler.pitch = target_angle[1];
                 gDroneControlAlgo.target_euler.yaw   = target_angle[2];
             }
-            /* 同步 MAVLink 目标油门到飞控算法 (所有非 DISABLED 模式共享) */
-            gDroneControlAlgo.target_throttle = target_throttle;
-            /* P0修复: 移除 TIM7 ISR 内阻塞打印, 每周期~4.3ms 占 43% 周期 */
-            // [DEBUG] 每50次打印一次油门链路验证 (约0.5s间隔) — 已禁用
-            // {
-            //     static uint16_t thr_dbg_cnt = 0;
-            //     if (++thr_dbg_cnt >= 50 && target_throttle > 0.01f) {
-            //         thr_dbg_cnt = 0;
-            //         Serial_Printf("[DEBUG] target_throttle=%.2fN -> algo=%.2fN\r\n",
-            //                       (double)target_throttle, (double)gDroneControlAlgo.target_throttle);
-            //     }
-            // }
+            /* 同步 MAVLink 目标油门 (VH 模式除外, 油门由速度+高度环计算) */
+            if (control_mode != CTRL_MODE_VH) {
+                gDroneControlAlgo.target_throttle = target_throttle;
+            }
 
+            /* ---- 4c. 角度外环 (ATTI / VH 共用) ---- */
             if (control_mode == CTRL_MODE_RATE) {
                 /* RATE 模式: 跳过外环, omega_ref 直接由 target_gyro 提供 */
                 gDroneControlAlgo.omega_ref.x = target_gyro[0];
                 gDroneControlAlgo.omega_ref.y = target_gyro[1];
                 gDroneControlAlgo.omega_ref.z = target_gyro[2];
             } else {
-                /* ATTI 模式: 角度外环, 每 5 次调用 1 次 (20Hz) */
+                /* ATTI / VH 模式: 角度外环, 每 5 次调用 1 次 (20Hz) */
                 if (++outer_loop_counter >= 5) {
                     outer_loop_counter = 0;
                     drone_control_angle_outer_loop();
                 }
             }
 
-            /* ---- 3c. 角速度内环: 每次调用 (100Hz) ---- */
+            /* ---- 4d. 角速度内环: 每次调用 (100Hz) ---- */
             drone_control_rate_inner_loop();
 
-            /* ---- 3d. 油门转换: rad/s → DSHOT (0~4095), 写入 current_throttle ---- */
+            /* ---- 4e. 油门转换: rad/s → DSHOT (0~4095), 写入 current_throttle ---- */
             uint16_t dshot_thr[4];
             for (int i = 0; i < 4; i++) {
                 float rad_s = gDroneControlAlgo.motor_throttle[i];
@@ -333,7 +357,7 @@ void TIM7_IRQHandler(void)
         }
         /* control_mode == DISABLED 时跳过飞控，油门由主循环的队列/串口手动控制 */
 
-        /* ========== 第4步: 周期性 MAVLink 发送 (复用已读取的 IMU 数据) ========== */
+        /* ========== 第5步: 周期性 MAVLink 发送 (复用已读取的 IMU 数据) ========== */
         mavlink_send_imu_periodic(&imu_data);
     }
 }

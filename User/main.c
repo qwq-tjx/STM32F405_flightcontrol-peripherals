@@ -89,6 +89,10 @@ int main(void)
 
     // 初始化 UART2 (MAVLink，含DMA)
     USART2_Init();
+    
+    // 初始化 UART3 (MTF-01 光流传感器)
+    UART3_Init();
+    Serial_Printf("UART3_Init\r\n");
 	    
     Serial_Printf("USART_Init\r\n");
     // 初始化 DSHOT
@@ -119,7 +123,7 @@ int main(void)
     {
         // 处理油门命令队列
         any_update = 0;
-        // ADC_PrintRaw();  // 取消注释可打印电池电压/VDDA/ADC原始值到USART1
+		//ADC_PrintRaw();  // 取消注释可打印电池电压/VDDA/ADC原始值到USART1
         DSHOT_ENTER_CRITICAL();
         while (throttle_cmd_available_unsafe()) {
             // 使用非临界区版本，避免嵌套 EXIT_CRITICAL 过早恢复中断

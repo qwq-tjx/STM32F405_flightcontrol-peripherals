@@ -14,6 +14,8 @@ extern volatile uint16_t current_throttle[4];
 volatile float  target_angle[3] = {0.0f, 0.0f, 0.0f};
 volatile float  target_gyro[3]  = {0.0f, 0.0f, 0.0f};
 volatile float  target_throttle = 0.0f;
+volatile float  target_velocity[3] = {0.0f, 0.0f, 0.0f};
+volatile float  target_altitude = 0.0f;
 volatile uint8_t control_mode   = CTRL_MODE_DISABLED;
 
 
@@ -328,11 +330,88 @@ void mavlink_send_servo_output(void)
     mavlink_send_message(&msg);
 }
 
+// ========== 发送机体速度 (LOCAL_POSITION_NED 消息, vx/vy/vz = m/s) ==========
+void mavlink_send_body_velocity(void)
+{
+    mavlink_message_t msg;
+    uint32_t time_ms = delay_ms_count_get();
+
+    mavlink_msg_local_position_ned_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_ms,
+        0.0f,                                    // x (位置, 无GPS)
+        0.0f,                                    // y
+        0.0f,                                    // z
+        gDroneControlAlgo.velocity.x,            // vx (机体X速度 m/s)
+        gDroneControlAlgo.velocity.y,            // vy (机体Y速度 m/s)
+        gDroneControlAlgo.velocity.z             // vz (机体Z速度 m/s)
+    );
+
+    mavlink_send_message(&msg);
+}
+
+// ========== 发送世界速度 + 融合高度 (GLOBAL_POSITION_INT 消息) ==========
+void mavlink_send_world_velocity_height(void)
+{
+    mavlink_message_t msg;
+    uint32_t time_ms = delay_ms_count_get();
+
+    mavlink_msg_global_position_int_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_ms,
+        0,                                       // lat (无GPS)
+        0,                                       // lon (无GPS)
+        0,                                       // alt (mm, 无GPS)
+        (int32_t)(gDroneControlAlgo.height * 1000.0f),  // relative_alt (mm)
+        (int16_t)(gDroneControlAlgo.velocity_world.x * 100.0f),  // vx (cm/s)
+        (int16_t)(gDroneControlAlgo.velocity_world.y * 100.0f),  // vy (cm/s)
+        (int16_t)(gDroneControlAlgo.velocity_world.z * 100.0f),  // vz (cm/s)
+        65535                                    // hdg (UINT16_MAX = 未知)
+    );
+
+    mavlink_send_message(&msg);
+}
+
+// ========== 回传飞控实际参考值 (DEBUG_FLOAT_ARRAY, name="REFS") ==========
+// data[0..2] = target_euler (rad, 实际角度参考)
+// data[3..5] = omega_ref (rad/s, 实际角速度参考)
+// data[6]    = target_throttle (N, 实际推力参考)
+// 用途: 地面站控件显示外环覆写的实时参考值 (活反馈)
+void mavlink_send_ref_values(void)
+{
+    mavlink_message_t msg;
+    uint32_t time_us = delay_us_count_get();
+
+    float refs_data[10] = {0};
+    refs_data[0] = gDroneControlAlgo.target_euler.roll;   // 实际角度参考 (rad)
+    refs_data[1] = gDroneControlAlgo.target_euler.pitch;
+    refs_data[2] = gDroneControlAlgo.target_euler.yaw;
+    refs_data[3] = gDroneControlAlgo.omega_ref.x;         // 实际角速度参考 (rad/s)
+    refs_data[4] = gDroneControlAlgo.omega_ref.y;
+    refs_data[5] = gDroneControlAlgo.omega_ref.z;
+    refs_data[6] = gDroneControlAlgo.target_throttle;     // 实际推力参考 (N)
+
+    mavlink_msg_debug_float_array_pack(
+        mavlink_system.sysid,
+        mavlink_system.compid,
+        &msg,
+        time_us,
+        "REFS",             // name[10]
+        0,                  // array_id
+        refs_data           // data[10]
+    );
+
+    mavlink_send_message(&msg);
+}
 
 
 // ========== 周期性 IMU 发送主函数 (TIM7 ISR 中调用, 100Hz) ==========
 // imu_data: 由 TIM7 ISR 在调用前一次性读取，传入复用，避免重复读取 IMU
-// 交错发送: 偶数轮发气压+高度+四元数, 奇数轮发 ScaledIMU+姿态
+// 交错发送: 偶数轮发气压+高度+四元数+世界速度, 奇数轮发 ScaledIMU+姿态+机体速度
 void mavlink_send_imu_periodic(WitImuData_t *imu_data)
 {
     static uint32_t last_attitude_time = 0;
@@ -364,10 +443,14 @@ void mavlink_send_imu_periodic(WitImuData_t *imu_data)
                 mavlink_send_imu_pressure(imu_data);     // 气压
                 mavlink_send_imu_altitude(imu_data);     // 高度
                 mavlink_send_imu_quaternion(imu_data);   // 四元数
+                mavlink_send_world_velocity_height();    // 世界速度+融合高度
+                mavlink_send_ref_values();               // 实际参考值回传 (REFS)
                 msg_phase = 1;
             } else {
                 mavlink_send_scaled_imu(imu_data);       // 加速度+角速度+磁力计
                 mavlink_send_imu_attitude(imu_data);     // 欧拉角+角速度
+                mavlink_send_body_velocity();            // 机体速度
+                mavlink_send_ref_values();               // 实际参考值回传 (REFS)
                 msg_phase = 0;
             }
         }
@@ -582,6 +665,29 @@ static void process_mavlink_message(mavlink_message_t *msg)
                 //     target_gyro[0]  * 57.29578f, target_gyro[1]  * 57.29578f, target_gyro[2]  * 57.29578f);
                 /* P0: ISR 内禁用阻塞打印 */
             }
+            else if (dbg.name[0] == 'V' && dbg.name[1] == 'E' && dbg.name[2] == 'L' && dbg.name[3] == 'H')
+            {
+                // 速度+高度控制模式 (name="VELH"): 世界坐标系速度 PID + 高度 PID
+                control_mode = CTRL_MODE_VH;
+
+                // 目标速度 (m/s, data[0-2], 限幅 ±100)
+                for (uint8_t i = 0; i < 3; i++) {
+                    float v = dbg.data[i];
+                    if (v > 100.0f) v = 100.0f;
+                    if (v < -100.0f) v = -100.0f;
+                    target_velocity[i] = v;
+                }
+                // 目标高度 (m, data[3])
+                target_altitude = dbg.data[3];
+
+                // data[4-6] 保留: 目标偏航角 (deg)
+                if (dbg.data[4] != 0.0f || dbg.data[5] != 0.0f || dbg.data[6] != 0.0f) {
+                    float yaw_deg = dbg.data[4];
+                    if (yaw_deg > 180.0f) yaw_deg = 180.0f;
+                    if (yaw_deg < -180.0f) yaw_deg = -180.0f;
+                    target_angle[2] = yaw_deg * (M_PI / 180.0f);  /* deg → rad */
+                }
+            }
             else if (dbg.name[0] == 'P' && dbg.name[1] == 'I' && dbg.name[2] == 'D' && dbg.name[3] == 'P')
             {
                 // PID参数设置 (name="PIDP"): 实时写入飞控PID
@@ -609,6 +715,35 @@ static void process_mavlink_message(mavlink_message_t *msg)
                 //     (double)p->pidx.Kp, (double)p->pidx.Ki, (double)p->pidx.Kd,
                 //     (double)p->pidy.Kp, (double)p->pidy.Ki, (double)p->pidy.Kd,
                 //     (double)p->pidz.Kp, (double)p->pidz.Ki, (double)p->pidz.Kd);
+                /* P0: ISR 内禁用阻塞打印 */
+            }
+            else if (dbg.name[0] == 'P' && dbg.name[1] == 'I' && dbg.name[2] == 'D' && dbg.name[3] == '2')
+            {
+                // PID2: 速度与高度控制PID (name="PID2")
+                // data[0]=T, data[1..3]=VX(Kp,Ki,Kd), data[4..6]=VY(Kp,Ki,Kd), data[7..9]=ALT(Kp,Ki,Kd)
+                drone_control_param_t *p = &gDroneControlAlgo.param;
+
+                p->T = dbg.data[0];
+
+                p->pid_vx.Kp = dbg.data[1];  p->pid_vx.Ki = dbg.data[2];  p->pid_vx.Kd = dbg.data[3];
+                p->pid_vy.Kp = dbg.data[4];  p->pid_vy.Ki = dbg.data[5];  p->pid_vy.Kd = dbg.data[6];
+                p->pid_alt.Kp = dbg.data[7]; p->pid_alt.Ki = dbg.data[8]; p->pid_alt.Kd = dbg.data[9];
+
+                // 自动设置积分限幅
+                p->pid_vx.integrate_limit = 5.0f;
+                p->pid_vy.integrate_limit = 5.0f;
+                p->pid_alt.integrate_limit = 2.0f;
+
+                // 写入新参数时重置积分累积
+                p->pid_vx.integrate = 0.0f;
+                p->pid_vy.integrate = 0.0f;
+                p->pid_alt.integrate = 0.0f;
+
+                // Serial_Printf("[PID2] T=%.3f vx(Kp=%.2f Ki=%.2f Kd=%.3f) vy(Kp=%.2f Ki=%.2f Kd=%.3f) alt(Kp=%.2f Ki=%.2f Kd=%.3f)\r\n",
+                //     (double)p->T,
+                //     (double)p->pid_vx.Kp, (double)p->pid_vx.Ki, (double)p->pid_vx.Kd,
+                //     (double)p->pid_vy.Kp, (double)p->pid_vy.Ki, (double)p->pid_vy.Kd,
+                //     (double)p->pid_alt.Kp, (double)p->pid_alt.Ki, (double)p->pid_alt.Kd);
                 /* P0: ISR 内禁用阻塞打印 */
             }
             else

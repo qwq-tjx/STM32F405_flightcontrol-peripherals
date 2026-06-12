@@ -49,6 +49,9 @@ void mavlink_send_battery_voltage(float voltage_V);
 void mavlink_send_imu_attitude(WitImuData_t *imu_data);    // 发送角度 (ATTITUDE)
 void mavlink_send_scaled_imu(WitImuData_t *imu_data);     // 发送加速度+角速度+磁力计 (HIGHRES_IMU)
 void mavlink_send_servo_output(void);                      // 发送舵机/电机输出 (SERVO_OUTPUT_RAW)
+void mavlink_send_body_velocity(void);                     // 发送机体速度 (LOCAL_POSITION_NED)
+void mavlink_send_world_velocity_height(void);              // 发送世界速度+融合高度 (GLOBAL_POSITION_INT)
+void mavlink_send_ref_values(void);                         // 回传实际参考值 (DEBUG_FLOAT_ARRAY, name="REFS")
 
 // ========== 周期性 IMU 发送主函数 (定时器中断中调用, 100Hz) ==========
 // imu_data 由调用者（TIM7 ISR）传入，避免重复读取

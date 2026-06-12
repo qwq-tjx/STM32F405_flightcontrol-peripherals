@@ -2,6 +2,7 @@
 #define __SERIAL_H
 
 #include <stdio.h>
+#include <stdint.h>
 #include "stm32f4xx.h"
 
 /* 辅助函数: 16位值转二进制字符串 (static 每个编译单元持有独立副本) */
@@ -30,5 +31,20 @@ uint8_t Serial_GetRxFlag(void);
 uint8_t Serial_GetRxData(void);
 void UART5_Init(void);
 void UART5_SendData(uint8_t *p_data, uint32_t uiSize);
+
+/* ---- UART3 光流传感器 (MTF-01) ---- */
+typedef struct {
+    volatile int16_t  flow_vel_x;     /* 光流 X 速度 (cm/s @ 1m) */
+    volatile int16_t  flow_vel_y;     /* 光流 Y 速度 (cm/s @ 1m) */
+    volatile uint32_t distance;       /* 激光测距 (mm), 0=不可用 */
+    volatile uint8_t  flow_quality;   /* 光流质量 (0~100) */
+    volatile uint8_t  fresh;          /* 新数据标志: UART3 ISR 置1, TIM7 ISR 清0 */
+} optflow_raw_t;
+
+extern volatile optflow_raw_t g_optflow;
+
+void UART3_Init(void);
+void USART2_IRQHandler(void);
+void USART3_IRQHandler(void);
 
 #endif

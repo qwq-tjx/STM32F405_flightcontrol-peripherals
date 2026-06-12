@@ -15,7 +15,7 @@
   * @brief  ADC 采样值（由 DMA 自动更新）
   * @note   取值范围：0 ~ 4095
   */
-volatile uint32_t adc_value = 0;
+volatile uint16_t adc_value = 0;
 
 /**
   * @brief  新数据标志位
@@ -83,6 +83,9 @@ void ADC_Config(void)
     ADC_InitStruct.ADC_NbrOfConversion = 1;                    /* 1 个转换通道 */
     ADC_Init(ADC1, &ADC_InitStruct);
 
+    /* 显式强制右对齐：ADC_Init 可能未正确清除 ALIGN 位 */
+    ADC1->CR2 &= ~(1 << 11);  /* CR2 bit11 = ALIGN: 0 = 右对齐 */
+
     /* ========== 5. 配置 ADC 通道 ========== */
     /* PC5 = ADC1 通道 15，采样时间 56 周期 */
     ADC_RegularChannelConfig(ADC1, ADC_Channel_15, 1, ADC_SampleTime_56Cycles);
@@ -96,8 +99,8 @@ void ADC_Config(void)
     DMA_InitStruct.DMA_BufferSize = 1;                                    /* 传输数量：1 */
     DMA_InitStruct.DMA_PeripheralInc = DMA_PeripheralInc_Disable;         /* 外设地址不变 */
     DMA_InitStruct.DMA_MemoryInc = DMA_MemoryInc_Disable;                 /* 内存地址不变 */
-    DMA_InitStruct.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Word;  /* 外设数据宽度：32 位（关键！）*/
-    DMA_InitStruct.DMA_MemoryDataSize = DMA_MemoryDataSize_Word;          /* 内存数据宽度：32 位 */
+    DMA_InitStruct.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;  /* 外设数据宽度：16 位（12bit ADC）*/
+    DMA_InitStruct.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;          /* 内存数据宽度：16 位 */
     DMA_InitStruct.DMA_Mode = DMA_Mode_Circular;                          /* 循环模式（关键！）*/
     DMA_InitStruct.DMA_Priority = DMA_Priority_Low;                       /* 低优先级（不影响 DShot）*/
     DMA_InitStruct.DMA_FIFOMode = DMA_FIFOMode_Disable;                   /* 禁用 FIFO */
@@ -134,23 +137,22 @@ void ADC_Config(void)
     ADC1->CR2 |= (1 << 30);               /* 设置 CAL 位，开始校准 */
     while(ADC1->CR2 & (1 << 30));         /* 等待校准完成 */
 
-    /* ========== 10. VREFINT 校准 —— 计算实际 VDDA ========== */
-    /* 原理: VREFINT 内部基准 ~1.21V 不随 VDDA 变化
-     *       工厂校准时 VDDA=3.3V, VREFINT 读数为 VREFINT_CAL_VALUE
-     *       实际 VDDA = 3.3V * VREFINT_CAL_VALUE / 实际 VREFINT 读数 */
-    ADC_TempSensorVrefintCmd(ENABLE);                    /* 使能内部 VREFINT */
-    Delay_ms(2);                                         /* 等待 VREFINT 稳定 */
-
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_17, 1,    /* 临时切换到 VREFINT 通道 */
-                             ADC_SampleTime_480Cycles);
-
-    ADC_SoftwareStartConv(ADC1);                         /* 启动单次转换 */
-    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));       /* 等待转换完成 */
-    uint16_t vrefint_reading = ADC_GetConversionValue(ADC1);
-
-    if (vrefint_reading > 0) {
-        g_VDDA = 3.3f * VREFINT_CAL_VALUE / (float)vrefint_reading;
-    }
+    /* ========== 10. VREFINT 校准 —— 已禁用 ========== */
+    /* 原因: VREFINT 校准时临时切通道导致 g_VDDA 计算异常，影响电池电压读取 */
+    /* 暂用默认 VDDA = 3.3V，后续可在工厂标定后启用 */
+    // ADC_TempSensorVrefintCmd(ENABLE);                    /* 使能内部 VREFINT */
+    // Delay_ms(2);                                         /* 等待 VREFINT 稳定 */
+    // 
+    // ADC_RegularChannelConfig(ADC1, ADC_Channel_17, 1,    /* 临时切换到 VREFINT 通道 */
+    //                          ADC_SampleTime_480Cycles);
+    // 
+    // ADC_SoftwareStartConv(ADC1);                         /* 启动单次转换 */
+    // while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));       /* 等待转换完成 */
+    // uint16_t vrefint_reading = ADC_GetConversionValue(ADC1);
+    // 
+    // if (vrefint_reading > 0) {
+    //     g_VDDA = 3.3f * VREFINT_CAL_VALUE / (float)vrefint_reading;
+    // }
     /* 注意: 若 VREFINT_CAL_VALUE 出厂未烧录 (0xFFFF), g_VDDA 保持默认 3.3f */
 
     /* ========== 11. 切回电池通道，启动 DMA 连续转换 ========== */
@@ -182,7 +184,7 @@ void ADC_Config(void)
   */
 float ADC_GetBatteryVoltage(void)
 {
-    const float DIVIDER_RATIO = 7.91f;    /* 电压分压比：实测反推 */
+    const float DIVIDER_RATIO = 11.0f;    /* 电压分压比：1/11 (10K+1K 分压) */
 
     /* 第1步：计算 ADC 采样点的实际电压（使用校准后的 VDDA）*/
     float voltage = (adc_value * g_VDDA) / 4096.0f;
@@ -216,7 +218,7 @@ float ADC_GetVDDA(void)
  */
 void ADC_PrintRaw(void)
 {
-    Serial_Printf("ADC Raw: %lu, VDDA: %.3fV, Battery: %.2fV\r\n",
+    Serial_Printf("ADC Raw: %u, VDDA: %.3fV, Battery: %.2fV\r\n",
                   adc_value, g_VDDA, ADC_GetBatteryVoltage());
 }
 
