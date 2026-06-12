@@ -20,19 +20,63 @@
 
 ## 引脚分配
 
-| 功能 | GPIO | 复用功能 | 说明 |
-|------|------|----------|------|
-| USART1 TX | PA9 | AF_USART1 | 调试控制台 + 油门控制 (115200) |
-| USART1 RX | PA10 | AF_USART1 | IMU 配置命令 + 油门接收 |
-| USART2 TX | PA2 | AF_USART2 | MAVLink 发送 (DMA) |
-| USART2 RX | PA3 | AF_USART2 | MAVLink 接收 |
-| UART5 TX | PC12 | AF_UART5 | IMU 传感器 |
-| UART5 RX | PD2 | AF_UART5 | IMU 数据接收 |
-| **电机1** | **PC6** | TIM8_CH1 | DSHOT15 |
-| **电机2** | **PC7** | TIM8_CH2 | DSHOT15 |
-| **电机3** | **PC8** | TIM8_CH3 | DSHOT15 |
-| **电机4** | **PC9** | TIM8_CH4 | DSHOT15 |
-| 电池检测 | PC5 | ADC1_CH15 | 24V 分压 (10K+1K) |
+### GPIO 外设
+
+| 功能 | 引脚 | 复用功能 | 外设 | 说明 |
+|------|------|----------|------|------|
+| USART1 TX | **PA9** | AF_USART1 | USART1 | 调试控制台 + 油门命令 (115200) |
+| USART1 RX | **PA10** | AF_USART1 | USART1 | IMU 配置 + 串口油门接收 |
+| USART2 TX | **PA2** | AF_USART2 | USART2 | MAVLink 遥测发送 (DMA1_Stream6) |
+| USART2 RX | **PA3** | AF_USART2 | USART2 | MAVLink 遥控信号接收 |
+| USART3 TX | **PB10** | AF_USART3 | USART3 | MTF-01 光流传感器 (115200) |
+| USART3 RX | **PB11** | AF_USART3 | USART3 | MTF-01 光流传感器接收 |
+| UART5 TX | **PC12** | AF_UART5 | UART5 | WitMotion IMU 传感器 (115200) |
+| UART5 RX | **PD2** | AF_UART5 | UART5 | IMU 姿态数据接收 |
+| 电机1 | **PC6** | AF_TIM8 | TIM8_CH1 | DSHOT15, DMA2_Stream2_Ch7 |
+| 电机2 | **PC7** | AF_TIM8 | TIM8_CH2 | DSHOT15, DMA2_Stream3_Ch7 |
+| 电机3 | **PC8** | AF_TIM8 | TIM8_CH3 | DSHOT15, DMA2_Stream4_Ch7 |
+| 电机4 | **PC9** | AF_TIM8 | TIM8_CH4 | DSHOT15, DMA2_Stream7_Ch7 |
+| 电池检测 | **PC5** | — (AN) | ADC1_CH15 | 24V 分压 (10K+1K), DMA2_Stream0 |
+| LED | **PB6** | — (GPIO) | GPIOB | 心跳指示, 1Hz 闪烁 |
+
+> **端口汇总**: GPIOA×4, GPIOB×3, GPIOC×7, GPIOD×1 → 共 15 个 GPIO
+
+### 内部定时器
+
+| 定时器 | 总线 | 用途 | 频率 | 参数 |
+|--------|------|------|:--:|------|
+| **TIM8** | APB2 | DSHOT 电机输出 | DSHOT15 位周期 | PSC=19, ARR=559 (8.4MHz 位时钟) |
+| **TIM7** | APB1 | 飞控主循环 + MAVLink | 100Hz | PSC=84-1, ARR=10000-1 |
+| **TIM6** | APB1 | 电池电压检测 | 1Hz | PSC=8400-1, ARR=10000-1 |
+| **SysTick** | 内核 | 系统延时基准 | 1ms | SystemCoreClock/1000 |
+| **DWT** | 内核 | μs 级精确延时 | 168MHz | Cycle Counter |
+
+### DMA 资源分配
+
+| DMA 数据流 | 通道 | 外设 | 方向 | 用途 | 优先级 |
+|-----------|------|------|:--:|------|:--:|
+| DMA2_Stream0 | Ch0 | ADC1 | P→M | 电池电压连续采样 | Low |
+| DMA2_Stream2 | Ch7 | TIM8_CC1 | M→P | DSHOT CH1 | VeryHigh |
+| DMA2_Stream3 | Ch7 | TIM8_CC2 | M→P | DSHOT CH2 | VeryHigh |
+| DMA2_Stream4 | Ch7 | TIM8_CC3 | M→P | DSHOT CH3 | VeryHigh |
+| DMA2_Stream7 | Ch7 | TIM8_CC4 | M→P | DSHOT CH4 | VeryHigh |
+| DMA1_Stream6 | Ch4 | USART2_TX | M→P | MAVLink 非阻塞发送 | Medium |
+
+### 中断优先级 (NVIC_PriorityGroup_2)
+
+| 中断源 | 抢占 | 子 | 用途 |
+|--------|:--:|:--:|------|
+| USART2_IRQn | 0 | 0 | MAVLink 遥控 (最高) |
+| UART5_IRQn | 0 | 1 | IMU 传感器数据 |
+| USART3_IRQn | 1 | 0 | MTF-01 光流传感器 |
+| DMA2_Stream2/3/4/7_IRQn | 1 | 0 | DSHOT DMA 传输完成 |
+| TIM7_IRQn | 2 | 0 | 飞控主循环 100Hz |
+| TIM6_DAC_IRQn | 3 | 2 | 电池检测 1Hz |
+| USART1_IRQn | 3 | 0 | 调试串口 |
+| DMA2_Stream0_IRQn | 3 | 0 | ADC DMA 传输完成 |
+| DMA1_Stream6_IRQn | 3 | 0 | USART2 DMA TX 完成 |
+| ADC_IRQn | 3 | 1 | ADC EOC (调试) |
+| SysTick_IRQn | 3 | 3 | 系统时基 (最低) |
 
 ---
 
