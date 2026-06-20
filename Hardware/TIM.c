@@ -319,7 +319,15 @@ void TIM7_IRQHandler(void)
             }
             /* 同步 MAVLink 目标油门 (VH 模式除外, 油门由速度+高度环计算) */
             if (control_mode != CTRL_MODE_VH) {
-                gDroneControlAlgo.target_throttle = target_throttle;
+                /* 油门死区保护: 记录最近一次有效非零推力, 防止消息冲突导致误清零 */
+                static float last_nonzero_thr = 0.0f;
+                if (target_throttle > 0.5f) {
+                    last_nonzero_thr = target_throttle;
+                }
+                /* 当目标推力 > 0.01N 时正常更新; 否则保持上一次非零值
+                   切换到 DISABLED 模式后重新上电可通过复位清零 */
+                gDroneControlAlgo.target_throttle =
+                    (target_throttle > 0.01f) ? target_throttle : last_nonzero_thr;
             }
 
             /* ---- 4c. 角度外环 (ATTI / VH 共用) ---- */
@@ -343,9 +351,9 @@ void TIM7_IRQHandler(void)
             uint16_t dshot_thr[4];
             for (int i = 0; i < 4; i++) {
                 float rad_s = gDroneControlAlgo.motor_throttle[i];
-                if (rad_s < 0.0f) rad_s = 0.0f;                         /* 负转速截断 */
-                uint32_t val = (uint32_t)(rad_s * RAD_S_TO_DSHOT);      /* rad/s → DSHOT */
-                if (val > 4095) val = 4095;                             /* 上限饱和 */
+                if (!is_good_float(rad_s) || rad_s < 0.0f) rad_s = 0.0f;   /* NaN/负转速截断 */
+                uint32_t val = (uint32_t)(rad_s * RAD_S_TO_DSHOT);          /* rad/s → DSHOT */
+                if (val > 4095) val = 4095;                                 /* 上限饱和 */
                 dshot_thr[i] = (uint16_t)val;
             }
 

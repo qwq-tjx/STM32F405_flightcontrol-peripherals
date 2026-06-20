@@ -6,6 +6,7 @@
 #include "mavlink.h"
 #include "wit_c_sdk.h"
 #include "mtf01.h"          /* micolink_decode() */
+#include "control.h"        /* control_mode, CTRL_MODE_DISABLED */
 
 //******************USART1*******************
 static uint8_t Serial_RxData;
@@ -207,28 +208,32 @@ static void Serial_ParseThrottle(uint8_t byte)
                             if (vals[k] > 4095) vals[k] = 4095;
                         }
 
-                        // 设置油门值（临界区保护）
-                        DSHOT_ENTER_CRITICAL();
-                        current_throttle[0] = vals[0];
-                        current_throttle[1] = vals[1];
-                        current_throttle[2] = vals[2];
-                        current_throttle[3] = vals[3];
-                        DSHOT_EXIT_CRITICAL();
+                        // 仅在 DISABLED 模式下允许串口油门直驱
+                        // 非 DISABLED 模式下飞控 PID 独占电机控制权，忽略串口油门防止覆盖
+                        if (control_mode == CTRL_MODE_DISABLED) {
+                            // 设置油门值（临界区保护）
+                            DSHOT_ENTER_CRITICAL();
+                            current_throttle[0] = vals[0];
+                            current_throttle[1] = vals[1];
+                            current_throttle[2] = vals[2];
+                            current_throttle[3] = vals[3];
+                            DSHOT_EXIT_CRITICAL();
 
-                        // 通知主循环更新DMA缓冲区
-                        serial_throttle_updated = 1;
+                            // 通知主循环更新DMA缓冲区
+                            serial_throttle_updated = 1;
 
-                        // 打印油门值、DSHOT帧及二进制到串口助手
-                        {
-                            uint16_t f0, f1, f2, f3;
-                            char b0[17], b1[17], b2[17], b3[17];
-                            f0 = (vals[0] << 4) | (((vals[0]>>8)&0x0F) + ((vals[0]>>4)&0x0F) + (vals[0]&0x0F)) & 0x0F;
-                            f1 = (vals[1] << 4) | (((vals[1]>>8)&0x0F) + ((vals[1]>>4)&0x0F) + (vals[1]&0x0F)) & 0x0F;
-                            f2 = (vals[2] << 4) | (((vals[2]>>8)&0x0F) + ((vals[2]>>4)&0x0F) + (vals[2]&0x0F)) & 0x0F;
-                            f3 = (vals[3] << 4) | (((vals[3]>>8)&0x0F) + ((vals[3]>>4)&0x0F) + (vals[3]&0x0F)) & 0x0F;
-                            fmt_bin16(f0, b0); fmt_bin16(f1, b1); fmt_bin16(f2, b2); fmt_bin16(f3, b3);
-                            Serial_Printf("[THR] SER: %d %d %d %d\r\n", vals[0], vals[1], vals[2], vals[3]);
-                            Serial_Printf("          BIN: %s %s %s %s\r\n", b0, b1, b2, b3);
+                            // 打印油门值、DSHOT帧及二进制到串口助手
+                            {
+                                uint16_t f0, f1, f2, f3;
+                                char b0[17], b1[17], b2[17], b3[17];
+                                f0 = (vals[0] << 4) | (((vals[0]>>8)&0x0F) + ((vals[0]>>4)&0x0F) + (vals[0]&0x0F)) & 0x0F;
+                                f1 = (vals[1] << 4) | (((vals[1]>>8)&0x0F) + ((vals[1]>>4)&0x0F) + (vals[1]&0x0F)) & 0x0F;
+                                f2 = (vals[2] << 4) | (((vals[2]>>8)&0x0F) + ((vals[2]>>4)&0x0F) + (vals[2]&0x0F)) & 0x0F;
+                                f3 = (vals[3] << 4) | (((vals[3]>>8)&0x0F) + ((vals[3]>>4)&0x0F) + (vals[3]&0x0F)) & 0x0F;
+                                fmt_bin16(f0, b0); fmt_bin16(f1, b1); fmt_bin16(f2, b2); fmt_bin16(f3, b3);
+                                Serial_Printf("[THR] SER: %d %d %d %d\r\n", vals[0], vals[1], vals[2], vals[3]);
+                                Serial_Printf("          BIN: %s %s %s %s\r\n", b0, b1, b2, b3);
+                            }
                         }
                     }
                 }

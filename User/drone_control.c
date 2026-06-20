@@ -121,15 +121,31 @@ float PID_update(float error, PID_data_t *p, float dt)
 {
     float output = 0.0f;
 
+    /* NaN/Inf 守卫: 输入异常时重置控制器状态，防止永久污染 PID 记忆 */
+    if (!is_good_float(error) || !is_good_float(dt) || dt < 1e-6f) {
+        p->integrate  = 0.0f;
+        p->last_error = 0.0f;
+        return 0.0f;
+    }
+
     output += p->Kp * error;                                           // 比例项（与 dt 无关）
 
     p->integrate += error * dt;                                        // 积分项：e * dt 累加
+    if (!is_good_float(p->integrate)) p->integrate = 0.0f;             // NaN 检查
     if (p->integrate >  p->integrate_limit) p->integrate =  p->integrate_limit;
     if (p->integrate < -p->integrate_limit) p->integrate = -p->integrate_limit;
     output += p->Ki * p->integrate;
 
     float derivative = (error - p->last_error) / dt;                   // 微分项：差分 / dt
+    if (!is_good_float(derivative)) derivative = 0.0f;                 // NaN 检查
     output += p->Kd * derivative;
+
+    /* 输出 NaN 检查：若计算结果异常，重置状态并返回 0 */
+    if (!is_good_float(output)) {
+        p->integrate  = 0.0f;
+        p->last_error = 0.0f;
+        return 0.0f;
+    }
 
     p->last_error = error;
     return output;
@@ -191,6 +207,13 @@ static vector_t compute_torque(vector_t alpha_ref, const vector_t *angular_veloc
 static void allocate_motors(float thrust_ref, vector_t torque_ref, const drone_control_param_t *param,
                              const float *prev_motor_throttle, float *out_motor_throttle)
 {
+    /* NaN/Inf 守卫: 输入异常时所有电机输出 0, 避免 NaN 传播到电调 */
+    if (!is_good_float(thrust_ref) || !is_good_float(torque_ref.x) ||
+        !is_good_float(torque_ref.y) || !is_good_float(torque_ref.z)) {
+        for (int i = 0; i < 4; i++) out_motor_throttle[i] = 0.0f;
+        return;
+    }
+
     float arm = param->arm_length;
     float c   = 0.70710678f * arm;                                     // 等效力臂 = arm / sqrt(2)
     float inv_4c  = 1.0f / (4.0f * c);
@@ -205,10 +228,34 @@ static void allocate_motors(float thrust_ref, vector_t torque_ref, const drone_c
 
     // 推力下标 → PWM 引脚映射: PC6→M2, PC7→M3, PC8→M1, PC9→M4
     static const uint8_t motor_to_pwm[4] = {2, 0, 1, 3};
+
+    // 第一步: 截断负推力，累计被截掉的负值
+    float sum_pos = 0.0f, sum_clipped = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        if (thrust[i] < 0.0f) {
+            sum_clipped += thrust[i];  // 累加负值 (sum_clipped ≤ 0)
+            thrust[i] = 0.0f;
+        } else {
+            sum_pos += thrust[i];
+        }
+    }
+
+    // 第二步: 推力重分配 —— 将负推力通道被截掉的量按比例从正推力通道中减掉
+    //         保持力矩比例不变，同时确保不引入新的负值
+    if (sum_clipped < 0.0f && sum_pos > 1e-6f) {
+        float scale = 1.0f + sum_clipped / sum_pos;  // scale ∈ (0, 1)
+        if (scale < 1e-6f) scale = 0.0f;             // 全饱和情况
+        for (int i = 0; i < 4; i++) {
+            thrust[i] *= scale;
+        }
+    }
+
     for (int i = 0; i < 4; i++) {
         float t = thrust[i];
-        if (t < 0.0f) t = 0.0f;
-        out_motor_throttle[motor_to_pwm[i]] = sqrtf(t * param->thrust_coeff);  // omega = sqrt(T * inv_kt)
+        if (!is_good_float(t) || t < 0.0f) t = 0.0f;
+        float rad_s = sqrtf(t * param->thrust_coeff);
+        if (!is_good_float(rad_s)) rad_s = 0.0f;
+        out_motor_throttle[motor_to_pwm[i]] = rad_s;
     }
     (void)prev_motor_throttle;
 }
@@ -254,7 +301,15 @@ void drone_control_angle_outer_loop(void)
     }
 
     // 提取轴角: 误差角 alpha_e = 2 * acos(q_e.w)
+    // NaN 守卫: q_e.w 为 NaN 时 (q_e.w != q_e.w) 为真, 安全退出, 避免 NaN 永久传播
     float cos_half_alpha = q_e.w;
+    if (!is_good_float(cos_half_alpha)) {
+        // 姿态四元数异常, 安全回退: omega_ref = 0, 不做任何角度修正
+        gDroneControlAlgo.omega_ref.x = 0.0f;
+        gDroneControlAlgo.omega_ref.y = 0.0f;
+        gDroneControlAlgo.omega_ref.z = 0.0f;
+        return;
+    }
     if (cos_half_alpha > 1.0f)  cos_half_alpha = 1.0f;
     if (cos_half_alpha < -1.0f) cos_half_alpha = -1.0f;
 
@@ -538,7 +593,7 @@ static void kalman_3d_predict(kalman_3d_t *kf, float acc_z_world)
     // ba 保持不变
 
     // 2. 协方差预测: P_new = F * P * F^T + Q
-    const float (*P)[3] = kf->P;
+    float (*P)[3] = kf->P;
 
     float P11 = P[0][0] + dt * (2.0f * P[0][1] + dt * P[1][1]);
     float P12 = P[0][1] + dt * P[1][1] + dt * (P[0][2] + dt * P[1][2]);
@@ -659,22 +714,29 @@ void velocity_height_Data_update(void)
     // ====== 4. Kalman 滤波预测 + 更新 ======
     kalman_3d_t *kf = &gDroneControlAlgo.kf_height;
 
-    // 预测步（加速度计驱动）
-    kalman_3d_predict(kf, acc_z_world);
+    // NaN 守卫: 若世界系加速度异常，跳过预测步，仅用观测更新 KF
+    if (is_good_float(acc_z_world)) {
+        kalman_3d_predict(kf, acc_z_world);
+    }
 
     // 更新步 1：气压计（始终可用，r 较大 → 权重低）
-    kalman_3d_update(kf, gDroneControlAlgo.altitude, kf->r_baro);
+    if (is_good_float(gDroneControlAlgo.altitude)) {
+        kalman_3d_update(kf, gDroneControlAlgo.altitude, kf->r_baro);
+    }
 
     // 更新步 2：激光 TOF — 激光质量与光流水平速度质量无关，使用固定 r_laser
     //   range > 0.001f (=1mm) 过滤掉 0（不可用），激光最小测量值 2mm
-    if (range > 0.001f) {
+    if (range > 0.001f && is_good_float(range)) {
         kalman_3d_update(kf, range, kf->r_laser);
     }
 
-    // ====== 5. 写回输出 ======
-    gDroneControlAlgo.height         = kf->z;
-    gDroneControlAlgo.velocity.z     = kf->vz;
-    gDroneControlAlgo.velocity_world.z = kf->vz;  // KF 垂直速度已为世界系
+    // ====== 5. 写回输出（含 NaN 防护） ======
+    if (is_good_float(kf->z))  gDroneControlAlgo.height  = kf->z;
+    if (is_good_float(kf->vz)) {
+        gDroneControlAlgo.velocity.z       = kf->vz;
+        gDroneControlAlgo.velocity_world.z = kf->vz;  // KF 垂直速度已为世界系
+    }
+    // 若 KF 状态异常，保持上一拍的有效值不变
 }
 
 // ============================================================
@@ -783,12 +845,17 @@ void drone_control_velocity_altitude_control(void)
     float pitch = -asinf(zx);
     float roll  = atan2f(zy, zz);
 
-    // ====== 8. 写入输出 ======
-    gDroneControlAlgo.target_euler.roll  = roll;
-    gDroneControlAlgo.target_euler.pitch = pitch;
+    // ====== 8. 写入输出（含 NaN 防护） ======
+    if (is_good_float(roll) && is_good_float(pitch)) {
+        gDroneControlAlgo.target_euler.roll  = roll;
+        gDroneControlAlgo.target_euler.pitch = pitch;
+    }
     // yaw 保持不变（由遥控器/上位机直接写入 target_euler.yaw）
 
     // 推力: T = m * ||[ax, ay, az+g]||
     // allocate_motors 内部用 0.025f * thrust_ref, 此处直接写入牛顿值
-    gDroneControlAlgo.target_throttle = param->mass * thrust_norm;
+    float thr = param->mass * thrust_norm;
+    if (is_good_float(thr)) {
+        gDroneControlAlgo.target_throttle = thr;
+    }
 }

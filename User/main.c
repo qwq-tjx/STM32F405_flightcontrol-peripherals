@@ -121,19 +121,21 @@ int main(void)
 
     while (1)
     {
-        // 处理油门命令队列
         any_update = 0;
-		//ADC_PrintRaw();  // 取消注释可打印电池电压/VDDA/ADC原始值到USART1
-        DSHOT_ENTER_CRITICAL();
-        while (throttle_cmd_available_unsafe()) {
-            // 使用非临界区版本，避免嵌套 EXIT_CRITICAL 过早恢复中断
-            throttle_cmd_dequeue_unsafe(&channel, &value);
-            current_throttle[channel] = value;
-            any_update = 1;
-        }
-        DSHOT_EXIT_CRITICAL();
 
-        // 串口调试油门更新
+        /* 非 DISABLED 模式下，飞控 PID 输出独占电机控制权；
+           仅在 DISABLED 模式下才允许 MAVLink 手动油门命令 (防止覆盖 PID 输出) */
+        if (control_mode == CTRL_MODE_DISABLED) {
+            DSHOT_ENTER_CRITICAL();
+            while (throttle_cmd_available_unsafe()) {
+                throttle_cmd_dequeue_unsafe(&channel, &value);
+                current_throttle[channel] = value;
+                any_update = 1;
+            }
+            DSHOT_EXIT_CRITICAL();
+        }
+
+        // 串口调试油门更新 (始终允许，DISABLED 下手动控制可用)
         if (serial_throttle_updated) {
             serial_throttle_updated = 0;
             any_update = 1;
