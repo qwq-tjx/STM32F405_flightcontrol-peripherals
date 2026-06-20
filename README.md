@@ -152,14 +152,7 @@ TIM7 ISR 100Hz 中调用 `mavlink_send_imu_periodic()`，默认 `attitude_interv
 | pid_vy (水平速度) | **2.0** | 0.1 | 0 | 5.0 | 速度控制 |
 | pid_alt (高度) | **0** | 0 | 0 | 0 | VELH 模式高度闭环 |
 
-代码注释中的**推荐调参起始值**（需通过上位机手动写入）：
 
-| 轴 | Kp | Ki | Kd | T |
-|----|-----|-----|-----|------|
-| Roll | 20 | 200 | 0 | 0.50s |
-| Pitch | 20 | 200 | 0 | |
-| Yaw | 25 | 250 | 0 | |
-| 高度 | 4 | 1 | 4 | — |
 
 > **注意**：高度 PID (`pid_alt`) 默认全零，切换 VELH 模式前必须通过上位机填入 Kp/Ki/Kd，否则仅有重力前馈无高度闭环修正。
 
@@ -384,18 +377,6 @@ target_throttle ← mass × thrust_norm
 
 ---
 
-## 上位机插件
-
-四个 Mission Planner 插件，位于工程根目录，使用 .NET Framework 4.7.2 编译。
-
-**编译**：
-```powershell
-msbuild ThrottleControlPlugin\ThrottleControlPlugin.csproj /p:Configuration=Release
-msbuild ImuVisualizationPlugin\ImuVisualizationPlugin.csproj /p:Configuration=Release
-msbuild TargetControlPlugin\TargetControlPlugin.csproj /p:Configuration=Release
-msbuild TargetThrottlePlugin\TargetThrottlePlugin.csproj /p:Configuration=Release
-```
-
 ### ThrottleControlPlugin — 飞控综合调参面板
 
 Mission Planner 插件，一站式飞控调参工具：
@@ -446,11 +427,6 @@ Mission Planner 插件，实时显示飞控传感器数据：
 - 姿态 / IMU / 高度 时间序列曲线图
 - 暂停刷新开关
 
-### 直接控制 (无插件)
-
-在 Mission Planner 的 `SERVO` 页面设置通道 9-12 的 PWM 值。
-
----
 
 ## 串口调试
 
@@ -534,7 +510,6 @@ DroneControl_Init
 │   ├── DSHOT.c/.h       DSHOT 电调驱动
 │   ├── Serial.c/.h      串口驱动 (USART1/2, UART5)
 │   ├── TIM.c/.h         定时器 + 飞控控制调度
-│   ├── PWM.c/.h         PWM 基础驱动
 │   ├── adc.c/.h         ADC 电池检测 (12-bit, DMA HalfWord)
 │   ├── Delay.c/.h       SysTick 延时
 │   ├── LED.c/.h         LED 指示
@@ -554,13 +529,8 @@ DroneControl_Init
 │   ├── control.c / control.h  控制模式 & 目标值
 │   ├── drone_control.c / drone_control.h  双环 PID 姿态 + 速度高度控制
 │   └── stm32f4xx_it.c   中断服务函数
-├── ThrottleControlPlugin/   Mission Planner 综合调参插件源码
-├── TargetControlPlugin/     Mission Planner 目标控制插件源码
-├── TargetThrottlePlugin/    目标油门独立插件源码
-├── ImuVisualizationPlugin/  Mission Planner IMU 可视化插件源码
 ├── ThrottleControlPlugin.dll   综合调参插件
 ├── TargetControlPlugin.dll     目标控制插件
-├── TargetThrottlePlugin.dll    目标油门插件 (精简备用)
 ├── ImuVisualizationPlugin.dll  IMU 可视化插件
 └── README.md
 ```
