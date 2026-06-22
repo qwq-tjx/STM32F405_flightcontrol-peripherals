@@ -384,27 +384,29 @@ void mavlink_send_world_velocity_height(void)
 void mavlink_send_ref_values(void)
 {
     mavlink_message_t msg;
-    uint32_t time_us = delay_us_count_get();
+    uint32_t time_ms = delay_ms_count_get();
 
-    float refs_data[10] = {0};
-    refs_data[0] = gDroneControlAlgo.target_euler.roll;   // 实际角度参考 (rad)
-    refs_data[1] = gDroneControlAlgo.target_euler.pitch;
-    refs_data[2] = gDroneControlAlgo.target_euler.yaw;
-    refs_data[3] = gDroneControlAlgo.omega_ref.x;         // 实际角速度参考 (rad/s)
-    refs_data[4] = gDroneControlAlgo.omega_ref.y;
-    refs_data[5] = gDroneControlAlgo.omega_ref.z;
-    refs_data[6] = gDroneControlAlgo.target_throttle;     // 实际推力参考 (N)
+    // 用 NAMED_VALUE_FLOAT (msgid=251) 回传, Mission Planner 兼容性更好
+    // 每次调用发送 4 条: omega_ref x3 + target_throttle
 
-    mavlink_msg_debug_float_array_pack(
-        mavlink_system.sysid,
-        mavlink_system.compid,
-        &msg,
-        time_us,
-        "REFS",             // name[10]
-        0,                  // array_id
-        refs_data           // data[10]
-    );
+    mavlink_msg_named_value_float_pack(
+        mavlink_system.sysid, mavlink_system.compid, &msg,
+        time_ms, "WRX", gDroneControlAlgo.omega_ref.x);
+    mavlink_send_message(&msg);
 
+    mavlink_msg_named_value_float_pack(
+        mavlink_system.sysid, mavlink_system.compid, &msg,
+        time_ms, "WRY", gDroneControlAlgo.omega_ref.y);
+    mavlink_send_message(&msg);
+
+    mavlink_msg_named_value_float_pack(
+        mavlink_system.sysid, mavlink_system.compid, &msg,
+        time_ms, "WRZ", gDroneControlAlgo.omega_ref.z);
+    mavlink_send_message(&msg);
+
+    mavlink_msg_named_value_float_pack(
+        mavlink_system.sysid, mavlink_system.compid, &msg,
+        time_ms, "THR", gDroneControlAlgo.target_throttle);
     mavlink_send_message(&msg);
 }
 
@@ -444,15 +446,22 @@ void mavlink_send_imu_periodic(WitImuData_t *imu_data)
                 mavlink_send_imu_altitude(imu_data);     // 高度
                 mavlink_send_imu_quaternion(imu_data);   // 四元数
                 mavlink_send_world_velocity_height();    // 世界速度+融合高度
-                mavlink_send_ref_values();               // 实际参考值回传 (REFS)
                 msg_phase = 1;
             } else {
                 mavlink_send_scaled_imu(imu_data);       // 加速度+角速度+磁力计
                 mavlink_send_imu_attitude(imu_data);     // 欧拉角+角速度
                 mavlink_send_body_velocity();            // 机体速度
-                mavlink_send_ref_values();               // 实际参考值回传 (REFS)
                 msg_phase = 0;
             }
+        }
+    }
+
+    // REFS 实际参考值回传 (10Hz, 独立于 attitude_stream_enabled)
+    {
+        static uint32_t last_refs_time = 0;
+        if (current_time - last_refs_time >= 100) {
+            last_refs_time = current_time;
+            mavlink_send_ref_values();
         }
     }
 }
@@ -670,11 +679,11 @@ static void process_mavlink_message(mavlink_message_t *msg)
                 // 速度+高度控制模式 (name="VELH"): 世界坐标系速度 PID + 高度 PID
                 control_mode = CTRL_MODE_VH;
 
-                // 目标速度 (m/s, data[0-2], 限幅 ±100)
+                // 目标速度 (m/s, data[0-2], 限幅 ±3)
                 for (uint8_t i = 0; i < 3; i++) {
                     float v = dbg.data[i];
-                    if (v > 100.0f) v = 100.0f;
-                    if (v < -100.0f) v = -100.0f;
+                    if (v > 3.0f) v = 3.0f;
+                    if (v < -3.0f) v = -3.0f;
                     target_velocity[i] = v;
                 }
                 // 目标高度 (m, data[3])
